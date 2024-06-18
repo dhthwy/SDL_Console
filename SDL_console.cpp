@@ -412,6 +412,8 @@ public:
     }
 
     virtual void render() {};
+    virtual void set_viewport(SDL_Rect new_viewport) {};
+    virtual void on_resize() {};
 
     virtual ~Widget() { }
 
@@ -556,13 +558,24 @@ struct Prompt : public Widget {
         }
     }
 
+    void on_resize() override
+    {
+        viewport = parent->viewport;
+        update_entry();
+    }
+
     void maybe_rebuild()
     {
         if (rebuild) {
-            std::u32string str = prompt_text + input;
-            make_logentry_lines(*this, entry, str);
+            update_entry();
             rebuild = false;
         }
+    }
+
+    void update_entry()
+    {
+        std::u32string str = prompt_text + input;
+        make_logentry_lines(*this, entry, str);
     }
 
     void render_cursor(int scroll_offset)
@@ -669,7 +682,7 @@ public:
         emit(InternalEventType::clicked);
     }
 
-    void render()
+    void render() override
     {
         // Align label to center of outer rect vertically and horizontally
         label_rect.x = viewport.x + (viewport.w / 2) - (label_rect.w / 2);
@@ -702,17 +715,13 @@ public:
 struct Toolbar : public Widget {
     Toolbar(Widget* parent);
     ~Toolbar() {};
-    void reset();
-    void render();
+    virtual void render() override;
+    virtual void on_resize() override;
+    virtual void set_viewport(SDL_Rect new_viewport) override;
     Button* add_button(std::u32string text);
     int compute_widgets_startx();
-    int height();
-    int width();
-    void set_width(int width);
-    void set_height(int height);
     void on_mouse_button_down(SDL_MouseButtonEvent& e);
     void on_mouse_button_up(SDL_MouseButtonEvent& e);
-    bool handle_sdl_event(SDL_Event& e);
     Toolbar(const Toolbar&) = delete;
     Toolbar& operator=(const Toolbar&) = delete;
 
@@ -942,20 +951,37 @@ struct LogScreen : public Widget {
         scroll_offset = std::min(std::max(0, scroll_offset), num_lines - 1);
     }
 
-    void on_resize()
+    void on_resize() override
     {
+        set_viewport({ viewport.x, viewport.y, parent->viewport.w, parent->viewport.h });
         num_lines = 0;
-        update_prompt_entry();
+        prompt.on_resize();
         /* XXX: we probably don't need to update outside visible view */
         for (auto& e : entries) {
             update_entry(e);
         }
     }
 
-    void update_prompt_entry()
+    void set_viewport(SDL_Rect new_viewport) override
     {
-        std::u32string str = prompt.prompt_text + prompt.input;
-        make_logentry_lines(*this, prompt.entry, str);
+        int margin = 4;
+        // max width
+        int w = new_viewport.w - margin;
+        // max width respect to font and margin
+        int wfit = (w / font->char_width) * font->char_width;
+        // max height
+        int h = new_viewport.h - new_viewport.y - margin;
+        // max height with respect to font and margin
+        int hfit = (h / font->line_height) * font->line_height;
+        // Adjust height to fit equally sized rows in the screen.
+        // Offset y with the delta, which may leave a bit of space below toolbar.
+        // Otherwise, there might be extra space at the bottom of the prompt.
+        int dh = h - hfit;
+
+        viewport.x = margin;
+        viewport.y = new_viewport.y + dh;
+        viewport.w = wfit;
+        viewport.h = hfit;
     }
 
     void on_new_output_line(std::u32string text)
@@ -1044,7 +1070,7 @@ struct LogScreen : public Widget {
         return (float)viewport.h / (float)font->line_height;
     }
 
-    void render()
+    void render() override
     {
         SDL_RenderSetViewport(renderer(), &viewport);
         prompt.maybe_rebuild();
@@ -1222,8 +1248,8 @@ struct Window : public Widget {
 
         toolbar = std::make_unique<Toolbar>(this);
 
-        toolbar->set_height(font->line_height * 2);
-        toolbar->set_width(viewport.w);
+        toolbar->set_viewport({ 0, 0, viewport.w, font->line_height * 2 });
+        log_screen.set_viewport({ 0, toolbar->viewport.h, viewport.w, viewport.h });
     }
 
     ~Window()
@@ -1237,30 +1263,11 @@ struct Window : public Widget {
     }
 
     // XXX: cleanup
-    void on_resize()
+    void on_resize() override
     {
         SDL_GetRendererOutputSize(renderer(), &viewport.w, &viewport.h);
         SDL_RenderSetViewport(renderer(), &viewport);
-
-        int margin = 4;
-        LogScreen& screen = log_screen;
-
-        // max width
-        int w = viewport.w - margin;
-        // max width respect to font and margin
-        int wfit = (w / font->char_width) * font->char_width;
-
-        // max height
-        int h = viewport.h - toolbar->height() - margin;
-        // max height with respect to font and margin
-        int hfit = (h / font->line_height) * font->line_height;
-        // Adjust height to fit equally sized rows in the screen.
-        // Offset y with the delta, which may leave a bit of space below toolbar.
-        // Otherwise, there might be extra space at the bottom of the prompt.
-        int dh = h - hfit;
-        screen.viewport = { margin, toolbar->height() + dh, wfit, hfit };
-
-        toolbar->viewport.w = viewport.w;
+        toolbar->on_resize();
         log_screen.on_resize();
     }
 
@@ -1289,26 +1296,6 @@ struct Window : public Widget {
 Toolbar::Toolbar(Widget* parent)
     : Widget(parent) {};
 
-int Toolbar::width()
-{
-    return viewport.w;
-}
-
-int Toolbar::height()
-{
-    return viewport.h;
-}
-
-void Toolbar::set_width(int width)
-{
-    viewport.w = width;
-}
-
-void Toolbar::set_height(int height)
-{
-    viewport.h = height;
-}
-
 void Toolbar::render()
 {
     set_draw_color(renderer(), colors::charcoal);
@@ -1330,6 +1317,16 @@ void Toolbar::render()
     }
 
     set_draw_color(renderer(), colors::darkgray);
+}
+
+void Toolbar::on_resize()
+{
+    viewport.w = parent->viewport.w;
+}
+
+void Toolbar::set_viewport(SDL_Rect new_viewport)
+{
+    viewport = new_viewport;
 }
 
 Button* Toolbar::add_button(std::u32string text)
@@ -1753,9 +1750,6 @@ Console_Create(const char* title,
         });
 
         con->lscreen().prompt.set_prompt(from_utf8(prompt));
-
-        // XXX, shouldn't need this here
-        con->impl->window.on_resize();
 
         // XXX: is this needed? XXX: pair with StopTextInput()
         SDL_StartTextInput();
