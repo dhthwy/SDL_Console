@@ -1614,10 +1614,12 @@ struct Console_con {
             , render_thread_id(std::this_thread::get_id())
         {
             external_event_waiter.reset();
+            SDL_StartTextInput();
         };
 
         ~Impl()
         {
+            SDL_StopTextInput();
             /* SDLEventFilter destructor resets event filter to saved event filter.
              * SDL_DestroyWindow handled by Window destructor.
              */
@@ -1750,10 +1752,6 @@ Console_Create(const char* title,
         });
 
         con->lscreen().prompt.set_prompt(from_utf8(prompt));
-
-        // XXX: is this needed? XXX: pair with StopTextInput()
-        SDL_StartTextInput();
-
         con->status = State::active;
 
         /*
