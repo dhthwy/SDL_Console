@@ -11,10 +11,8 @@
 #include <locale>
 #include <map>
 #include <mutex>
-#include <optional>
 #include <queue>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string>
 #include <thread>
@@ -27,16 +25,12 @@ static constexpr size_t default_scrollback = 1024;
 
 static std::u32string from_utf8(const char* str)
 {
-    if (*str == '\0')
-        return U"";
     std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> c;
     return c.from_bytes(str);
 }
 
 static std::string to_utf8(const std::u32string& str)
 {
-    if (str.empty())
-        return "";
     std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> c;
     return c.to_bytes(str);
 }
@@ -340,7 +334,7 @@ public:
     EventEmitter& operator=(const EventEmitter&) = delete;
 
 private:
-    std::map<int, std::vector<Handler>> handlers;
+    std::map<Uint32, std::vector<Handler>> handlers;
 };
 
 struct Window;
@@ -506,10 +500,13 @@ struct Prompt : public Widget {
         if (dir == ScrollDirection::up) {
             if (idx > 0)
                 idx--;
+            else
+                return;
         } else {
             if (idx < history.size() - 1)
                 idx++;
         }
+        return;
 
         history_idx = idx;
         input = history[idx].text;
@@ -971,8 +968,8 @@ struct LogScreen : public Widget {
     {
         auto both = prompt.prompt_text + text;
         auto& l = create_entry(EntryType::input, both);
-        prompt.history.emplace_back(text);
-        prompt.history_idx = prompt.history.size();
+        // prompt.history.emplace_back(text);
+        // prompt.history_idx = prompt.history.size();
 
         update_entry(l);
 
@@ -1196,7 +1193,6 @@ struct WindowContext {
 };
 
 struct Window : public Widget {
-    FontLoader loader;
     WidgetContext widget_context;
     SDL_Window* handle { nullptr };
     SDL_Point mouse_coord {}; // stores mouse position relative to window
@@ -1258,6 +1254,7 @@ struct Window : public Widget {
         int h = viewport.h - toolbar->height() - margin;
         // max height with respect to font and margin
         int hfit = (h / font->line_height) * font->line_height;
+        // Adjust height to fit equally sized rows in the screen.
         // Offset y with the delta, which may leave a bit of space below toolbar.
         // Otherwise, there might be extra space at the bottom of the prompt.
         int dh = h - hfit;
@@ -1603,7 +1600,7 @@ struct Console_con {
     struct Impl {
         EventEmitter internal_emitter;
         Window window;
-        FontLoader font_loader;
+        std::unique_ptr<FontLoader> font_loader;
         SDL_Color bg_color; // not currently used
         SDL_Color font_color; // not currently used
         InputLineWaiter input_line_waiter;
@@ -1611,8 +1608,8 @@ struct Console_con {
         SDLEventFilterSetter event_filter_setter;
         std::thread::id render_thread_id;
 
-        Impl(WindowContext wctx, FontLoader& fl, ExternalEventWaiter& external_event_waiter)
-            : window(wctx, fl.get_font(), internal_emitter)
+        Impl(WindowContext wctx, std::unique_ptr<FontLoader> fl, ExternalEventWaiter& external_event_waiter)
+            : window(wctx, fl->get_font(), internal_emitter)
             , font_loader(std::move(fl))
             , input_line_waiter(internal_emitter)
             , external_event_waiter(external_event_waiter)
@@ -1631,15 +1628,11 @@ struct Console_con {
     };
 
     Console_con() = default;
-    ~Console_con()
-    {
-        if (impl)
-            delete impl;
-    };
+    ~Console_con() = default;
 
-    void init(WindowContext wctx, FontLoader& fl)
+    void init(WindowContext wctx, std::unique_ptr<FontLoader> fl)
     {
-        impl = new Impl(wctx, fl, external_event_waiter);
+        impl = std::make_unique<Impl>(wctx, std::move(fl), external_event_waiter);
     }
 
     bool is_active()
@@ -1665,7 +1658,7 @@ struct Console_con {
      */
     ExternalEventWaiter external_event_waiter;
     std::atomic<State> status { State::active };
-    Impl* impl { nullptr };
+    std::unique_ptr<Impl> impl;
     std::mutex mutex;
 };
 static Console_con num_con[1];
@@ -1739,15 +1732,15 @@ Console_Create(const char* title,
             640, 480,
             SDL_WINDOW_RESIZABLE);
 
-        FontLoader font_loader;
-        auto font = font_loader.open("source_code_pro.ttf", font_size);
+        auto font_loader = std::make_unique<FontLoader>();
+        auto font = font_loader->open("source_code_pro.ttf", font_size);
         if (font == nullptr) {
             std::cerr << "error initializing TTF: " << TTF_GetError();
             return nullptr;
         }
 
         Console_con* con = &num_con[0];
-        con->init(wctx, font_loader);
+        con->init(wctx, std::move(font_loader));
 
         Widget* copy = con->impl->window.toolbar->add_button(U"Copy");
         copy->subscribe(InternalEventType::clicked, [con](SDL_Event& e) {
@@ -1800,10 +1793,10 @@ void Console_SetPrompt(Console_con* con,
 int Console_MainLoop(Console_con* con)
 {
     while (1) {
-        auto impl = con->impl;
+        auto impl = con->impl.get();
         // No mutex should be needed yet.
         // Data writes happen only on the render thread.
-        if (render_frame(con->impl))
+        if (render_frame(impl))
             return -1;
 
         impl->external_event_waiter.wait_for_events();
@@ -1811,7 +1804,7 @@ int Console_MainLoop(Console_con* con)
             std::scoped_lock lock(con->mutex);
             SDL_Event event;
             while (impl->external_event_waiter.sdl.pop(event)) {
-                handle_sdl_event(con->impl, event);
+                handle_sdl_event(impl, event);
             }
             ExternalEventWaiter::Task f;
             while (impl->external_event_waiter.api.pop(f)) {
@@ -1873,24 +1866,21 @@ void Console_Shutdown(Console_con* con)
     assert(con);
     con->status = State::shutdown;
     // Must push an event to wake up the main render thread
-    con->impl->external_event_waiter.api.push([con] {
-        // Empty input line to wake any waiters from GetLine()
-        //    tty->impl->internal_emitter.emit(InternalEventType::new_input_line);
-    });
+    con->impl->external_event_waiter.api.push([con] {});
 }
 
 // XXX: cleanup properly
 bool Console_Destroy(Console_con* con)
 {
     assert(con);
-    if (std::this_thread::get_id() != con->impl->render_thread_id)
-        return false;
-
     if (con->status == State::inactive)
         return true;
 
+    if (std::this_thread::get_id() != con->impl->render_thread_id)
+        return false;
+
     con->status = State::inactive;
-    delete con->impl;
+    con->impl.reset();
     SDL_QuitSubSystem(SDL_INIT_VIDEO);
     return true;
 }
