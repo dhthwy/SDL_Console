@@ -753,9 +753,8 @@ struct InputLineWaiter {
         {
             std::scoped_lock l(m);
             completed = true;
-            completed.notify_one();
         }
-        std::scoped_lock bl(busy_mutex);
+        completed.notify_one();
         // std::cerr << "shutdown inputreader exit" << std::endl;
     }
 
@@ -763,7 +762,6 @@ struct InputLineWaiter {
     int
     wait_get(std::string& buf)
     {
-        std::scoped_lock busy_lock(busy_mutex);
         std::unique_lock<std::recursive_mutex> lock(m);
         if (input_q.empty()) {
             lock.unlock();
@@ -779,8 +777,6 @@ struct InputLineWaiter {
         input_q.pop();
         return buf.length();
     }
-
-    std::recursive_mutex busy_mutex;
 
 private:
     std::recursive_mutex m;
@@ -1238,6 +1234,7 @@ struct Window : public Widget {
     SDL_Point mouse_coord {}; // stores mouse position relative to window
     std::unique_ptr<Toolbar> toolbar; // optional toolbar. XXX: implementation requires it
     LogScreen log_screen;
+    Uint32 window_id;
     void render() {};
 
     Window(WindowContext winctx, Font* font, EventEmitter& emitter)
@@ -1246,6 +1243,10 @@ struct Window : public Widget {
         , handle(winctx.handle)
         , log_screen(this)
     {
+        window_id = SDL_GetWindowID(handle);
+        if (window_id == 0)
+            throw(std::runtime_error(SDL_GetError()));
+
         subscribe_global(SDL_WINDOWEVENT, [this](SDL_Event& e) {
             if (e.window.event == SDL_WINDOWEVENT_RESIZED) {
                 on_resize();
@@ -1449,13 +1450,11 @@ public:
             status = State::shutdown;
         }
         drain();
-        std::scoped_lock l(busy_mutex);
     }
 
     ExternalEventWaiter(const ExternalEventWaiter&) = delete;
     ExternalEventWaiter& operator=(const ExternalEventWaiter&) = delete;
 
-    std::mutex busy_mutex;
     EventQueue<SDL_Event> sdl;
     using Task = std::function<void()>;
     EventQueue<Task> api;
@@ -1619,12 +1618,12 @@ struct Console_con {
         SDLEventFilterSetter event_filter_setter;
         std::thread::id render_thread_id;
 
-        Impl(WindowContext wctx, std::unique_ptr<FontLoader> fl, ExternalEventWaiter& external_event_waiter)
+        Impl(Console_con* con, WindowContext wctx, std::unique_ptr<FontLoader> fl, ExternalEventWaiter& external_event_waiter)
             : window(wctx, fl->get_font(), internal_emitter)
             , font_loader(std::move(fl))
             , input_line_waiter(internal_emitter)
             , external_event_waiter(external_event_waiter)
-            , event_filter_setter(on_sdl_event, this)
+            , event_filter_setter(on_sdl_event, con)
             , render_thread_id(std::this_thread::get_id())
         {
             external_event_waiter.reset();
@@ -1645,7 +1644,7 @@ struct Console_con {
 
     void init(WindowContext wctx, std::unique_ptr<FontLoader> fl)
     {
-        impl = std::make_unique<Impl>(wctx, std::move(fl), external_event_waiter);
+        impl = std::make_unique<Impl>(this, wctx, std::move(fl), external_event_waiter);
     }
 
     bool is_active()
@@ -1653,7 +1652,7 @@ struct Console_con {
         return status == State::active;
     }
 
-    bool is_shutdown()
+    bool is_shuttingdown()
     {
         return status == State::shutdown;
     }
@@ -1673,6 +1672,8 @@ struct Console_con {
     std::atomic<State> status { State::active };
     std::unique_ptr<Impl> impl;
     std::mutex mutex;
+    std::mutex getline_inproc_mutex;
+    std::mutex on_sdl_event_inproc_mutex;
 };
 static Console_con num_con[1];
 
@@ -1709,21 +1710,32 @@ int handle_sdl_event(Console_con::Impl* impl, SDL_Event& e)
 
 int on_sdl_event(void* data, SDL_Event* e)
 {
-    auto impl = static_cast<Console_con::Impl*>(data);
-    std::scoped_lock l(impl->external_event_waiter.busy_mutex);
+    auto con = static_cast<Console_con*>(data);
+    std::scoped_lock l(con->on_sdl_event_inproc_mutex);
 
-    if (e->type == SDL_QUIT)
-        return impl->event_filter_setter.maybe_call_saved(data, e);
+    /*
+     * If shutting down then it isn't safe to continue further.
+     * This check is likely unnecessary (needs testing) since
+     * SDL drains pending events when the event filter is removed.
+     */
+    if (con->is_shuttingdown())
+        return 1;
 
-    // maybe also check SDL_GetMouseFocus
-    const Uint32 flags = SDL_GetWindowFlags(impl->window.handle);
-    if (!(flags & SDL_WINDOW_INPUT_FOCUS)) {
-        return impl->event_filter_setter.maybe_call_saved(data, e);
+    if (e->type == SDL_WINDOWEVENT && e->window.windowID != con->impl->window.window_id) {
+        return 1;
+    } else {
+
+        // TODO: Check for Window specific events targeting our window, if not,
+        // fallback to SDL_GetWindowFlags() and possibly SDL_GetMouseFocus()
+        const Uint32 flags = SDL_GetWindowFlags(con->impl->window.handle);
+        if (!(flags & SDL_WINDOW_INPUT_FOCUS)) {
+            return con->impl->event_filter_setter.maybe_call_saved(data, e);
+        }
     }
 
     SDL_Event ec;
     std::memcpy(&ec, e, sizeof(SDL_Event));
-    impl->external_event_waiter.sdl.push(ec);
+    con->impl->external_event_waiter.sdl.push(ec);
     return 0;
 }
 }
@@ -1831,10 +1843,16 @@ int Console_MainLoop(Console_con* con)
             }
         }
 
-        if (con->is_shutdown()) {
+        if (con->is_shuttingdown()) {
             impl->event_filter_setter.reset_saved();
             impl->input_line_waiter.shutdown();
+            {
+                std::scoped_lock l(con->getline_inproc_mutex);
+            }
             impl->external_event_waiter.shutdown();
+            {
+                std::scoped_lock l(con->on_sdl_event_inproc_mutex);
+            }
             break;
         }
     }
@@ -1906,6 +1924,8 @@ bool Console_Destroy(Console_con* con)
 
 int Console_GetLine(Console_con* con, std::string& buf)
 {
+    std::scoped_lock l(con->getline_inproc_mutex);
+
     if (!con->is_active())
         return -1;
 
