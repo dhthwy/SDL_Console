@@ -88,10 +88,6 @@ void make_logentry_lines(
     LogEntry& entry,
     std::u32string& text);
 
-struct History {
-    std::u32string text;
-};
-
 struct LogEntryLine {
     SDL_Texture* texture; // texture of line
     size_t index; // line index into entries
@@ -429,6 +425,7 @@ struct Prompt : public Widget {
     Prompt(Widget* parent)
         : Widget(parent)
     {
+        input = &history.emplace_back(U"");
         // Create 1x1 texture for the cursor, it will be stretched to fit the font's line height and character width
         cursor_texture = SDL_CreateTexture(renderer(), SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STATIC, 1, 1);
         if (cursor_texture == nullptr)
@@ -483,7 +480,7 @@ struct Prompt : public Widget {
     void set_prompt(const std::u32string& str)
     {
         prompt_text = str;
-        entry.text = str + input;
+        entry.text = str + *input;
         rebuild = true;
     }
 
@@ -495,9 +492,6 @@ struct Prompt : public Widget {
      */
     void set_input_from_history(ScrollDirection dir)
     {
-        if (history.empty())
-            return;
-
         size_t idx = history_idx;
         if (dir == ScrollDirection::up) {
             if (idx > 0)
@@ -507,23 +501,24 @@ struct Prompt : public Widget {
         } else {
             if (idx < history.size() - 1)
                 idx++;
+            else
+                return;
         }
-        return;
 
         history_idx = idx;
-        input = history[idx].text;
-        cursor = history[idx].text.length();
+        input = &history[idx];
+        cursor = input->length();
         rebuild = true;
     }
 
     void add_input(const std::u32string& str)
     {
         /* if cursor is at end of line, it's a simple concatenation */
-        if (cursor == input.length()) {
-            input += str;
+        if (cursor == input->length()) {
+            *input += str;
         } else {
             /* else insert text into line at cursor's index */
-            input.insert(cursor, str);
+            input->insert(cursor, str);
         }
         cursor += str.length();
         rebuild = true;
@@ -531,14 +526,14 @@ struct Prompt : public Widget {
 
     void erase_input()
     {
-        if (cursor == 0 || input.length() == 0)
+        if (cursor == 0 || input->length() == 0)
             return;
 
-        if (input.length() == cursor) {
-            input.pop_back();
+        if (input->length() == cursor) {
+            input->pop_back();
         } else {
             /* else shift the text from cursor left by one character */
-            input.erase(cursor, 1);
+            input->erase(cursor, 1);
         }
         cursor -= 1;
         rebuild = true;
@@ -553,7 +548,7 @@ struct Prompt : public Widget {
 
     void move_cursor_right()
     {
-        if (cursor < input.length()) {
+        if (cursor < input->length()) {
             cursor++;
         }
     }
@@ -574,7 +569,7 @@ struct Prompt : public Widget {
 
     void update_entry()
     {
-        std::u32string str = prompt_text + input;
+        std::u32string str = prompt_text + *input;
         make_logentry_lines(*this, entry, str);
     }
 
@@ -622,13 +617,13 @@ struct Prompt : public Widget {
 
     LogEntry entry; // prompt may be line wrapped
     std::u32string prompt_text;
-    std::u32string input;
+    std::u32string* input;
     bool rebuild { true };
     size_t cursor { 0 }; /* position of cursor within a line */
     /* 1x1 texture */
     SDL_Texture* cursor_texture;
     /* For input history */
-    std::vector<History> history;
+    std::deque<std::u32string> history;
     int history_idx;
 };
 
@@ -754,12 +749,14 @@ struct InputLineWaiter {
 
     void shutdown()
     {
+        // std::cerr << "shutdown inputreader" << std::endl;
         {
             std::scoped_lock l(m);
             completed = true;
             completed.notify_one();
         }
         std::scoped_lock bl(busy_mutex);
+        // std::cerr << "shutdown inputreader exit" << std::endl;
     }
 
     /* This function may be called recursively */
@@ -774,6 +771,7 @@ struct InputLineWaiter {
             lock.lock();
             completed = false;
             if (input_q.empty()) {
+                // std::cerr << "input_q=empty()" << std::endl;
                 return 0;
             }
         }
@@ -795,9 +793,12 @@ struct LogScreen : public Widget {
     Prompt prompt;
 
     int scroll_offset { 0 };
+    SDL_Point viewport_offset;
     int max_lines { default_scrollback }; /* max numbers of lines allowed */
     int num_lines { 0 };
     bool mouse_depressed { false };
+    SDL_Point mouse_motion_start { -1, -1 };
+    SDL_Point mouse_motion_end { -1, -1 };
 
     LogScreen(Widget* parent)
         : Widget(parent)
@@ -862,7 +863,7 @@ struct LogScreen : public Widget {
             break;
 
         case SDLK_RETURN:
-            on_new_input_line(prompt.input);
+            on_new_input_line(*prompt.input);
         case SDLK_BACKSPACE:
         case SDLK_UP:
         case SDLK_DOWN:
@@ -916,10 +917,10 @@ struct LogScreen : public Widget {
         mouse_motion_end = p;
     }
 
-    void translate_coord(SDL_Point& p)
+    void translate_coord(SDL_Point& window_p)
     {
-        p.x -= viewport.x;
-        p.y -= viewport.y;
+        window_p.x -= viewport.x;
+        window_p.y -= viewport.y;
     }
 
     void on_scroll(int y)
@@ -953,10 +954,16 @@ struct LogScreen : public Widget {
 
     void on_resize() override
     {
-        set_viewport({ viewport.x, viewport.y, parent->viewport.w, parent->viewport.h });
+        viewport.w = parent->viewport.w;
+        viewport.h = parent->viewport.h;
+        adjust_viewport();
         num_lines = 0;
         prompt.on_resize();
-        /* XXX: we probably don't need to update outside visible view */
+        /*
+         * TODO: we probably don't need to re-render everything outside
+         * visible view.
+         * For large scrollback, the slowdown when resizing is noticable.
+         */
         for (auto& e : entries) {
             update_entry(e);
         }
@@ -964,22 +971,28 @@ struct LogScreen : public Widget {
 
     void set_viewport(SDL_Rect new_viewport) override
     {
+        viewport_offset = { new_viewport.x, new_viewport.y };
+        viewport = new_viewport;
+        adjust_viewport();
+    }
+
+    // Set viewport dimensions based on margin and font constraints.
+    // Viewport must support equally sized rows large enough to fit font height.
+    // Similarly, equally sized columns to fit font's char_width.
+    void adjust_viewport()
+    {
         int margin = 4;
         // max width
-        int w = new_viewport.w - margin;
+        int w = viewport.w - (margin * 2);
         // max width respect to font and margin
         int wfit = (w / font->char_width) * font->char_width;
         // max height
-        int h = new_viewport.h - new_viewport.y - margin;
+        int h = viewport.h - viewport_offset.y - margin;
         // max height with respect to font and margin
         int hfit = (h / font->line_height) * font->line_height;
-        // Adjust height to fit equally sized rows in the screen.
-        // Offset y with the delta, which may leave a bit of space below toolbar.
-        // Otherwise, there might be extra space at the bottom of the prompt.
-        int dh = h - hfit;
 
-        viewport.x = margin;
-        viewport.y = new_viewport.y + dh;
+        viewport.x = viewport_offset.x + margin;
+        viewport.y = viewport_offset.y + margin;
         viewport.w = wfit;
         viewport.h = hfit;
     }
@@ -990,18 +1003,20 @@ struct LogScreen : public Widget {
         update_entry(l);
     }
 
+    // TODO: cleanup, most of this belongs in Prompt
     void on_new_input_line(const std::u32string text)
     {
         auto both = prompt.prompt_text + text;
         auto& l = create_entry(EntryType::input, both);
-        // prompt.history.emplace_back(text);
-        // prompt.history_idx = prompt.history.size();
+        prompt.history.emplace_back(text);
 
         update_entry(l);
 
-        emit_global(InternalEventType::new_input_line, &prompt.input);
+        emit_global(InternalEventType::new_input_line, prompt.input);
 
-        prompt.input.clear();
+        prompt.input = &prompt.history.emplace_back(U"");
+        prompt.history_idx = prompt.history.size() - 1;
+
         prompt.cursor = 0;
         prompt.rebuild = true;
     }
@@ -1074,6 +1089,8 @@ struct LogScreen : public Widget {
     {
         SDL_RenderSetViewport(renderer(), &viewport);
         prompt.maybe_rebuild();
+        // TODO: make sure renderer supports blending else highlighting
+        // will make the text invisible
         render_highlighted_lines();
         render_lines();
         // Prompt input rendering is done in render_lines()
@@ -1200,9 +1217,6 @@ struct LogScreen : public Widget {
 
     LogScreen(const LogScreen&) = delete;
     LogScreen& operator=(const LogScreen&) = delete;
-
-    SDL_Point mouse_motion_start { -1, -1 };
-    SDL_Point mouse_motion_end { -1, -1 };
 };
 
 struct WindowContext {
@@ -1262,7 +1276,6 @@ struct Window : public Widget {
         }
     }
 
-    // XXX: cleanup
     void on_resize() override
     {
         SDL_GetRendererOutputSize(renderer(), &viewport.w, &viewport.h);
@@ -1309,6 +1322,7 @@ void Toolbar::render()
     int x = (parent->viewport.w - margin_right) - compute_widgets_startx();
 
     // Lay out horizontally
+    // TODO: don't calculate child widget offsets here
     for (auto& w : widgets) {
         w->viewport.x = x;
         x += w->viewport.w;
@@ -1346,7 +1360,7 @@ int Toolbar::compute_widgets_startx()
     for (auto& w : widgets) {
         x += w->viewport.w;
     }
-    return x + (widgets.size() - 1);
+    return x;
 }
 
 class ExternalEventWaiter {
@@ -1751,6 +1765,18 @@ Console_Create(const char* title,
             con->lscreen().on_get_clipboard_text();
         });
 
+        /*
+         * Best to change font size in a menu, I think.
+        Widget* font_inc = con->impl->window.toolbar->add_button(U"A+");
+        font_inc->subscribe(InternalEventType::clicked, [con](SDL_Event& e) {
+
+        });
+
+        Widget* font_dec = con->impl->window.toolbar->add_button(U"A-");
+        font_dec->subscribe(InternalEventType::clicked, [con](SDL_Event& e) {
+
+        });*/
+
         con->lscreen().prompt.set_prompt(from_utf8(prompt));
         con->status = State::active;
 
@@ -1767,6 +1793,7 @@ Console_Create(const char* title,
 
         return con;
     } catch (std::runtime_error& e) {
+        SDL_QuitSubSystem(SDL_INIT_VIDEO);
         std::cerr << e.what() << std::endl;
         return nullptr;
     }

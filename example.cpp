@@ -41,6 +41,10 @@ int main(int argc, char** argv)
             } else if (buf == "test5") {
                 Console_AddLine(con, "\n");
                 Console_AddLine(con, "");
+            } else if (buf == "test6") {
+                for (int i = 0; i < 2000; i++) {
+                    Console_AddLine(con, "❤ ♥ Really long output! Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed tincidunt, odio quis pulvinar suscipit, dolor nibh lobortis massa, quis sollicitudin ipsum sapien nec leo. Donec id sem sapien. Quisque dignissim eget sem ac bibendum. Suspendisse aliquam est finibus tellus molestie faucibus. Vestibulum volutpat feugiat nulla ut pharetra. Etiam facilisis, nunc in ullamcorper tempus, velit ante molestie turpis, at aliquet orci odio in arcu. Aenean dignissim dolor libero, et rhoncus felis elementum hendrerit. Donec aliquam accumsan nunc, vitae tempor sem tristique non. Duis at velit libero. Fusce ac justo vel leo lacinia vehicula sed vel felis. Nullam lacus orci, faucibus eu dapibus nec, gravida quis dui. Fusce faucibus, eros eu dignissim pharetra, velit velit imperdiet urna, gravida commodo est arcu eget lectus. Nunc leo ipsum, maximus vel dictum sit amet, maximus vitae arcu. Donec suscipit elit nec dolor lobortis rhoncus ♥ ❤");
+                }
             } else if (buf == "shutdown") {
                 Console_Shutdown(con);
                 break;
@@ -48,6 +52,10 @@ int main(int argc, char** argv)
                 // echo
                 Console_AddLine(con, buf.c_str());
             }
+        } else {
+            // GetLine returned <= 0
+            Console_Shutdown(con);
+            break;
         }
     }
     do_draw = false;
@@ -71,6 +79,7 @@ void thread_fun()
         while (SDL_PollEvent(&e)) {
             switch (e.type) {
             case SDL_QUIT:
+                printf("Got SDL_QUIT\n");
                 Console_Shutdown(con);
                 goto quit;
                 break;
