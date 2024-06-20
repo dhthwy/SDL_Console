@@ -1903,7 +1903,7 @@ void Console_Shutdown(Console_con* con)
     assert(con);
     con->status = State::shutdown;
     // Must push an event to wake up the main render thread
-    con->impl->external_event_waiter.api.push([con] {});
+    con->impl->external_event_waiter.api.push([] {});
 }
 
 // XXX: cleanup properly

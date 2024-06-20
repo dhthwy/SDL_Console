@@ -26,7 +26,7 @@ int main(int argc, char** argv)
 
     while (1) {
         std::string buf;
-        if (Console_GetLine(con, buf) > 0) {
+        if (Console_GetLine(con, buf) >= 0) {
             if (buf == "clear") {
                 Console_Clear(con);
             } else if (buf == "test") {
@@ -53,7 +53,7 @@ int main(int argc, char** argv)
                 Console_AddLine(con, buf.c_str());
             }
         } else {
-            // GetLine returned <= 0
+            // GetLine returned < 0
             Console_Shutdown(con);
             break;
         }
