@@ -1,14 +1,15 @@
 #include <SDL2/SDL.h>
+#include <SDL2/SDL_error.h>
 #include <SDL2/SDL_events.h>
 #include <SDL2/SDL_ttf.h>
 #include <algorithm>
 #include <assert.h>
 #include <atomic>
-#include <codecvt>
+// #include <codecvt>
 #include <cstring>
 #include <functional>
 #include <iostream>
-#include <locale>
+// #include <locale>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -21,8 +22,15 @@
 
 #include "SDL_console.h"
 
+namespace console {
 static constexpr size_t default_scrollback = 1024;
 
+#if 0
+/*
+ * std::wstring_convert and std::codecvt_utf8 are deprecated
+ * since C++17 and MSVC will warn with -W4.
+ * Implementations are known to be lackluster.
+ */
 static std::u32string from_utf8(const char* str)
 {
     std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> c;
@@ -34,8 +42,163 @@ static std::string to_utf8(const std::u32string& str)
     std::wstring_convert<std::codecvt_utf8<char32_t>, char32_t> c;
     return c.to_bytes(str);
 }
+#endif
 
-namespace console {
+static std::string to_utf8(const std::u32string& s)
+{
+    // Can be removed if confirmed iconv plays well with empty strings
+    if (s.empty())
+        return "";
+
+    // Not sure how safe this is.
+    const char* p = reinterpret_cast<const char*>(s.c_str());
+    // Need to make room for utf8 + terminating null, so can't use character count here..
+    char* conv_bytes = SDL_iconv_string("UTF-8", "UTF32", p, (s.length() + 1) * sizeof(char32_t));
+    if (!conv_bytes)
+        return "";
+
+    std::string result = conv_bytes;
+    SDL_free(conv_bytes);
+    return result;
+}
+
+/*
+ * Slightly modified version from SDL
+ * https://github.com/libsdl-org/SDL/blob/ab3c8552c2733e03c47253c5840bed7a27716244/src/stdlib/SDL_string.c#L157C8-L157C21
+ */
+
+#define INVALID_UNICODE_CODEPOINT 0xFFFD
+static Uint32 SDL_StepUTF8(const char* _str, int* pos, const size_t slen)
+{
+    const char* str = (_str + *pos);
+    const Uint32 octet = (Uint32)(slen ? ((Uint8)*str) : 0);
+
+    // !!! FIXME: this could have _way_ more error checking! Illegal surrogate codepoints, unexpected bit patterns, etc.
+
+    if (octet == 0) { // null terminator, end of string.
+        return 0; // don't advance `*_str`.
+    } else if ((octet & 0x80) == 0) { // 0xxxxxxx: one byte codepoint.
+        (*pos)++;
+        return octet;
+    } else if (((octet & 0xE0) == 0xC0) && (slen >= 2)) { // 110xxxxx 10xxxxxx: two byte codepoint.
+        if (slen >= 2) {
+            *pos += 2;
+            return ((octet & 0x1F) << 6) | (((Uint8)str[1]) & 0x3F);
+        }
+    } else if (((octet & 0xF0) == 0xE0) && (slen >= 3)) { // 1110xxxx 10xxxxxx 10xxxxxx: three byte codepoint.
+        *pos += 3;
+        const Uint32 octet2 = ((Uint32)(((Uint8)str[1]) & 0x1F)) << 6;
+        const Uint32 octet3 = (Uint32)(((Uint8)str[2]) & 0x3F);
+        return ((octet & 0x0F) << 12) | octet2 | octet3;
+    } else if (((octet & 0xF8) == 0xF0) && (slen >= 4)) { // 11110xxxx 10xxxxxx 10xxxxxx 10xxxxxx: four byte codepoint.
+        *pos += 4;
+        const Uint32 octet2 = ((Uint32)(((Uint8)str[1]) & 0x1F)) << 12;
+        const Uint32 octet3 = ((Uint32)(((Uint8)str[2]) & 0x3F)) << 6;
+        const Uint32 octet4 = (Uint32)(((Uint8)str[3]) & 0x3F);
+        return ((octet & 0x07) << 18) | octet2 | octet3 | octet4;
+    }
+
+    // bogus byte, skip ahead, return a REPLACEMENT CHARACTER.
+    (*pos)++;
+    return INVALID_UNICODE_CODEPOINT;
+}
+
+#if 0
+static std::u32string from_utf8(const char* s)
+{
+    int char_len = SDL_utf8strlen(s);
+    if (char_len == 0)
+        return U"";
+    char32_t* conv_bytes = reinterpret_cast<char32_t*>(SDL_iconv_string("UTF32", "UTF-8", s, char_len + 1));
+    if (!conv_bytes)
+        return U"";
+
+    std::u32string result = (*conv_bytes == 0xFEFF) ? conv_bytes + 1 : conv_bytes;
+    SDL_free(reinterpret_cast<char*>(conv_bytes));
+    return result;
+}
+#endif
+
+static std::u32string from_utf8(const char* str)
+{
+    // Do we care about truncating long lines?
+    // 8k bytes, might be smart to reduce it to a memory page.
+    char32_t buf[2048];
+    constexpr int buf_siz = sizeof(buf) / sizeof(char32_t);
+
+    int step = 0;
+    int idx = 0;
+    for (Uint32 codepoint = 1; codepoint && idx < buf_siz - 1; ++idx) {
+        // SDL_StepUTF8 isn't exported, but just in case.
+        codepoint = console::SDL_StepUTF8(str, &step, 4);
+        buf[idx] = codepoint;
+    }
+    // Terminate in case line was too long.
+    buf[idx] = U'\0';
+    return buf;
+}
+
+// For testing purposes, to be removed
+static const std::unordered_map<char32_t, uint8_t> unicode_to_cp437 = {
+    // Control characters and symbols
+    /* NULL           */ { U'\u263A', 0x01 }, { U'\u263B', 0x02 }, { U'\u2665', 0x03 },
+    { U'\u2666', 0x04 }, { U'\u2663', 0x05 }, { U'\u2660', 0x06 }, { U'\u2022', 0x07 },
+    { U'\u25D8', 0x08 }, { U'\u25CB', 0x09 }, { U'\u25D9', 0x0A }, { U'\u2642', 0x0B },
+    { U'\u2640', 0x0C }, { U'\u266A', 0x0D }, { U'\u266B', 0x0E }, { U'\u263C', 0x0F },
+
+    { U'\u25BA', 0x10 }, { U'\u25C4', 0x11 }, { U'\u2195', 0x12 }, { U'\u203C', 0x13 },
+    { U'\u00B6', 0x14 }, { U'\u00A7', 0x15 }, { U'\u25AC', 0x16 }, { U'\u21A8', 0x17 },
+    { U'\u2191', 0x18 }, { U'\u2193', 0x19 }, { U'\u2192', 0x1A }, { U'\u2190', 0x1B },
+    { U'\u221F', 0x1C }, { U'\u2194', 0x1D }, { U'\u25B2', 0x1E }, { U'\u25BC', 0x1F },
+
+    // ASCII, no mapping needed
+
+    // Extended Latin characters and others
+    { U'\u2302', 0x7F },
+
+    { U'\u00C7', 0x80 }, { U'\u00FC', 0x81 }, { U'\u00E9', 0x82 }, { U'\u00E2', 0x83 },
+    { U'\u00E4', 0x84 }, { U'\u00E0', 0x85 }, { U'\u00E5', 0x86 }, { U'\u00E7', 0x87 },
+    { U'\u00EA', 0x88 }, { U'\u00EB', 0x89 }, { U'\u00E8', 0x8A }, { U'\u00EF', 0x8B },
+    { U'\u00EE', 0x8C }, { U'\u00EC', 0x8D }, { U'\u00C4', 0x8E }, { U'\u00C5', 0x8F },
+
+    { U'\u00C9', 0x90 }, { U'\u00E6', 0x91 }, { U'\u00C6', 0x92 }, { U'\u00F4', 0x93 },
+    { U'\u00F6', 0x94 }, { U'\u00F2', 0x95 }, { U'\u00FB', 0x96 }, { U'\u00F9', 0x97 },
+    { U'\u00FF', 0x98 }, { U'\u00D6', 0x99 }, { U'\u00DC', 0x9A }, { U'\u00A2', 0x9B },
+    { U'\u00A3', 0x9C }, { U'\u00A5', 0x9D }, { U'\u20A7', 0x9E }, { U'\u0192', 0x9F },
+
+    { U'\u00E1', 0xA0 }, { U'\u00ED', 0xA1 }, { U'\u00F3', 0xA2 }, { U'\u00FA', 0xA3 },
+    { U'\u00F1', 0xA4 }, { U'\u00D1', 0xA5 }, { U'\u00AA', 0xA6 }, { U'\u00BA', 0xA7 },
+    { U'\u00BF', 0xA8 }, { U'\u2310', 0xA9 }, { U'\u00AC', 0xAA }, { U'\u00BD', 0xAB },
+    { U'\u00BC', 0xAC }, { U'\u00A1', 0xAD }, { U'\u00AB', 0xAE }, { U'\u00BB', 0xAF },
+
+    // Box drawing characters
+    { U'\u2591', 0xB0 }, { U'\u2592', 0xB1 }, { U'\u2593', 0xB2 }, { U'\u2502', 0xB3 },
+    { U'\u2524', 0xB4 }, { U'\u2561', 0xB5 }, { U'\u2562', 0xB6 }, { U'\u2556', 0xB7 },
+    { U'\u2555', 0xB8 }, { U'\u2563', 0xB9 }, { U'\u2551', 0xBA }, { U'\u2557', 0xBB },
+    { U'\u255D', 0xBC }, { U'\u255C', 0xBD }, { U'\u255B', 0xBE }, { U'\u2510', 0xBF },
+
+    { U'\u2514', 0xC0 }, { U'\u2534', 0xC1 }, { U'\u252C', 0xC2 }, { U'\u251C', 0xC3 },
+    { U'\u2500', 0xC4 }, { U'\u253C', 0xC5 }, { U'\u255E', 0xC6 }, { U'\u255F', 0xC7 },
+    { U'\u255A', 0xC8 }, { U'\u2554', 0xC9 }, { U'\u2569', 0xCA }, { U'\u2566', 0xCB },
+    { U'\u2560', 0xCC }, { U'\u2550', 0xCD }, { U'\u256C', 0xCE }, { U'\u2567', 0xCF },
+
+    { U'\u2568', 0xD0 }, { U'\u2564', 0xD1 }, { U'\u2565', 0xD2 }, { U'\u2559', 0xD3 },
+    { U'\u2558', 0xD4 }, { U'\u2552', 0xD5 }, { U'\u2553', 0xD6 }, { U'\u256B', 0xD7 },
+    { U'\u256A', 0xD8 }, { U'\u2518', 0xD9 }, { U'\u250C', 0xDA }, { U'\u2588', 0xDB },
+    { U'\u2584', 0xDC }, { U'\u258C', 0xDD }, { U'\u2590', 0xDE }, { U'\u2580', 0xDF },
+
+    // Mathematical symbols and others
+    { U'\u03B1', 0xE0 }, { U'\u00DF', 0xE1 }, { U'\u0393', 0xE2 }, { U'\u03C0', 0xE3 },
+    { U'\u03A3', 0xE4 }, { U'\u03C3', 0xE5 }, { U'\u00B5', 0xE6 }, { U'\u03C4', 0xE7 },
+    { U'\u03A6', 0xE8 }, { U'\u0398', 0xE9 }, { U'\u03A9', 0xEA }, { U'\u03B4', 0xEB },
+    { U'\u221E', 0xEC }, { U'\u03C6', 0xED }, { U'\u03B5', 0xEE }, { U'\u2229', 0xEF },
+
+    { U'\u2261', 0xF0 }, { U'\u00B1', 0xF1 }, { U'\u2265', 0xF2 }, { U'\u2264', 0xF3 },
+    { U'\u2320', 0xF4 }, { U'\u2321', 0xF5 }, { U'\u00F7', 0xF6 }, { U'\u2248', 0xF7 },
+    { U'\u00B0', 0xF8 }, { U'\u2219', 0xF9 }, { U'\u00B7', 0xFA }, { U'\u221A', 0xFB },
+    { U'\u207F', 0xFC }, { U'\u00B2', 0xFD }, { U'\u25A0', 0xFE }, { U'\u00A0', 0xFF }
+};
+
 enum class ScrollDirection { up,
     down,
     page_up,
@@ -62,6 +225,7 @@ enum class EntryType { input,
     output };
 
 namespace colors {
+    // Default palette. Needs more. Needs configurable.
     const SDL_Color white = { 255, 255, 255, 255 };
     const SDL_Color lightgray = { 211, 211, 211, 255 };
     const SDL_Color mediumgray = { 65, 65, 65, 255 };
@@ -88,34 +252,32 @@ void make_logentry_lines(
     LogEntry& entry,
     std::u32string& text);
 
-struct LogEntryLine {
-    SDL_Texture* texture; // texture of line
+struct WrappedLine {
+    std::u32string_view text; // text of line segment
     size_t index; // line index into entries
-    size_t start_index; // index into entry text
-    size_t end_index; // index into entry text
-    SDL_Rect rect {};
+    size_t start_index; // index into entry text, still needed?
+    size_t end_index; // index into entry text, still needed?
+    SDL_Point coord {};
 
-    LogEntryLine(SDL_Texture* texture, size_t line_index, size_t start_index, size_t end_index)
-        : texture(texture)
+    WrappedLine(std::u32string_view& text, size_t line_index, size_t start_index, size_t end_index)
+        : text(text)
         , index(line_index)
         , start_index(start_index)
-        , end_index(end_index)
-    {
-        SDL_QueryTexture(texture, NULL, NULL, &rect.w, &rect.h);
-    };
+        , end_index(end_index) {};
 
-    ~LogEntryLine()
+    ~WrappedLine()
     {
-        SDL_DestroyTexture(texture);
     }
 
-    LogEntryLine(const LogEntryLine&) = delete;
-    LogEntryLine& operator=(const LogEntryLine&) = delete;
+    WrappedLine(const WrappedLine&) = delete;
+    WrappedLine& operator=(const WrappedLine&) = delete;
 };
 
-using LogEntryLines = std::deque<LogEntryLine>;
+using LogEntryLines = std::deque<WrappedLine>;
 struct LogEntry {
     EntryType type;
+    // Unmolested text. May not to keep this; However, it could
+    // come in handy if we want the original output saved to a file.
     std::u32string text;
     SDL_Rect rect;
     size_t size { 0 }; // total # of lines
@@ -126,9 +288,9 @@ struct LogEntry {
         : type(type)
         , text(text) {};
 
-    auto& add_line(SDL_Texture* texture, size_t start_index, size_t end_index)
+    auto& add_line(std::u32string_view& text, size_t start_index, size_t end_index)
     {
-        return lines_.emplace_back(texture, size++, start_index, end_index);
+        return lines_.emplace_back(text, size++, start_index, end_index);
     }
 
     void clear()
@@ -149,16 +311,32 @@ private:
     LogEntryLines lines_;
 };
 
+struct Glyph {
+    SDL_Rect rect;
+};
 struct FontLoader;
+// XXX, TODO: cleanup. Same object shouldn't try to do TTF and bitmap fonts
 struct Font {
     FontLoader& loader;
-    TTF_Font* handle;
+    SDL_Surface* surface;
+    //   TTF_Font* handle;
+    SDL_Texture* texture;
+    std::vector<Glyph> glyphs;
     int char_width;
     int line_height;
 
+    /*
     Font(FontLoader& loader, TTF_Font* handle, int char_width, int line_height)
         : loader(loader)
-        , handle(handle)
+        , char_width(char_width)
+        , line_height(line_height)
+    {
+    }*/
+
+    Font(FontLoader& loader, SDL_Surface* surface, std::vector<Glyph>& glyphs, int char_width, int line_height)
+        : loader(loader)
+        , surface(surface)
+        , glyphs(glyphs)
         , char_width(char_width)
         , line_height(line_height)
     {
@@ -168,22 +346,61 @@ struct Font {
     {
     }
 
+    // TODO: scaling
+    void render(SDL_Renderer* renderer, const std::u32string_view& text, int x, int y)
+    {
+        // int scale = 1;
+        for (auto& ch : text) {
+            char32_t index;
+            if (ch <= 127)
+                index = ch;
+            else {
+                index = unicode_glyph_index(ch);
+            }
+            Glyph& g = glyphs[index];
+            //  int x = (x + g.rect.w/2) - (g.rect.w/2 * scale);
+            //  int y = (y + g.rect.h/2) - (g.rect.h/2 * scale);
+            SDL_Rect dst = { x, y, g.rect.w, g.rect.h };
+            x += g.rect.w;
+            SDL_RenderCopy(renderer, texture, &g.rect, &dst);
+        }
+    }
+
+    // Get the surface size of a text.
+    // Mono-spaced faces have the equal widths and heights.
+    void text_surface_size(const std::u32string& s, int& w, int& h)
+    {
+        w = s.length() * char_width;
+        h = line_height;
+    }
+
+    char32_t unicode_glyph_index(const char32_t ch)
+    {
+        auto it = unicode_to_cp437.find(ch);
+        if (it != unicode_to_cp437.end()) {
+            return it->second;
+        }
+        return '?';
+    }
+
     Font(Font&& other) noexcept
         : loader(other.loader)
-        , handle(other.handle)
+        , surface(other.surface)
+        , texture(other.texture)
+        , glyphs(other.glyphs)
         , char_width(other.char_width)
         , line_height(other.line_height)
     {
-        other.handle = nullptr;
     }
 
     Font& operator=(Font&& other) noexcept
     {
         if (this != &other) {
-            handle = other.handle;
+            surface = other.surface;
+            texture = other.texture;
+            glyphs = other.glyphs;
             char_width = other.char_width;
             line_height = other.line_height;
-            other.handle = nullptr;
         }
         return *this;
     }
@@ -196,12 +413,89 @@ using FontMap = std::map<std::pair<std::string, int>, Font>;
 struct FontLoader {
     FontLoader()
     {
+#if 0
+        if (TTF_Init()) {
+            throw std::runtime_error(TTF_GetError());
+        }
+#endif
+    }
+
+    ~FontLoader()
+    {
+#if 0
+        for (auto& pair : fmap) {
+            if (pair.second.handle) {
+                TTF_CloseFont(pair.second.handle);
+            }
+        }
+
+        TTF_Quit();
+#endif
+    }
+
+    Font* open(const std::string& path, int size)
+    {
+#if 0
+        auto key = std::make_pair(path, size);
+        auto it = fmap.find(key);
+
+        if (it != fmap.end()) {
+            return &it->second;
+        }
+
+        auto* handle = TTF_OpenFont(path.c_str(), size);
+        if (!handle) {
+            return nullptr;
+        }
+
+        int char_width;
+        int line_height;
+        if (TTF_SizeUTF8(handle, "a", &char_width, &line_height)) {
+            TTF_CloseFont(handle);
+            return nullptr;
+        }
+
+        auto result = fmap.emplace(key, Font(*this, handle, char_width, line_height));
+        return &result.first->second;
+#endif
+        return nullptr;
+    }
+
+    Font* get_font()
+    {
+        return &fmap.begin()->second;
+    }
+
+    FontLoader(const FontLoader&) = delete;
+    FontLoader& operator=(const FontLoader&) = delete;
+
+    FontLoader(FontLoader&& other) noexcept
+        : fmap(std::move(other.fmap))
+    {
+    }
+
+    FontLoader& operator=(FontLoader&& other) noexcept
+    {
+        if (this != &other) {
+            fmap = std::move(other.fmap);
+        }
+        return *this;
+    }
+
+protected:
+    FontMap fmap;
+};
+
+#if 0
+struct TTFontLoader : public FontLoader {
+    TTFontLoader()
+    {
         if (TTF_Init()) {
             throw std::runtime_error(TTF_GetError());
         }
     }
 
-    ~FontLoader()
+    ~TTFontLoader()
     {
         for (auto& pair : fmap) {
             if (pair.second.handle) {
@@ -242,33 +536,171 @@ struct FontLoader {
         return &fmap.begin()->second;
     }
 
-    FontLoader(const FontLoader&) = delete;
-    FontLoader& operator=(const FontLoader&) = delete;
+    TTFontLoader(const TTFontLoader&) = delete;
+    TTFontLoader& operator=(const TTFontLoader&) = delete;
 
-    FontLoader(FontLoader&& other) noexcept
-        : fmap(std::move(other.fmap))
-    {
-    }
-
-    FontLoader& operator=(FontLoader&& other) noexcept
+    TTFontLoader& operator=(TTFontLoader&& other) noexcept
     {
         if (this != &other) {
             fmap = std::move(other.fmap);
         }
         return *this;
     }
+};
+#endif
 
-private:
-    FontMap fmap;
+struct BMPFontLoader : public FontLoader {
+    BMPFontLoader()
+    {
+    }
+
+    ~BMPFontLoader()
+    {
+        /* TODO: cleanup
+        for (auto& pair : fmap) {
+            // Fonts may share this data
+            // Clear fonts, then destroy()
+            // SDL_FreeSurface(pair.second.surface);
+            // SDL_DestroyTexture(pair.second.texture);
+        }*/
+    }
+
+    Font* open(const std::string& path, int size)
+    {
+        auto key = std::make_pair(path, size);
+        auto it = fmap.find(key);
+
+        if (it != fmap.end()) {
+            return &it->second;
+        }
+
+        SDL_Surface* glyph_surface = SDL_LoadBMP(path.c_str());
+        if (glyph_surface == nullptr) {
+            return nullptr;
+        }
+
+        SDL_ConvertSurfaceFormat(glyph_surface, SDL_PIXELFORMAT_RGBA32, 0);
+        Uint32 bg_color = SDL_MapRGB(glyph_surface->format, 255, 0, 255);
+        SDL_SetColorKey(glyph_surface, SDL_TRUE, bg_color);
+
+        std::vector<Glyph> glyphs;
+        extract_glyphs(glyph_surface, bg_color, 16, 16, glyphs);
+
+        // TODO: don't hard code
+        // add additional width if needed to adjust spacing between characters
+        int char_width = 8;
+        // add additional height if needed to adjust spacing between lines
+        int line_height = 14;
+
+        auto result = fmap.emplace(key, Font(*this, glyph_surface, glyphs, char_width, line_height));
+        return &result.first->second;
+    }
+
+    bool extract_glyphs(const SDL_Surface* surface, const Uint32 bg_color,
+        const int columns, const int rows, std::vector<Glyph>& glyphs)
+    {
+        Uint32* pixels = static_cast<Uint32*>(surface->pixels);
+
+        int width = surface->w;
+        int height = surface->h;
+        int tile_w = width / columns;
+        int tile_h = height / rows;
+
+        glyphs.reserve(columns * rows);
+
+        for (int y = 0; y < height; y += tile_h) {
+            for (int x = 0; x < width; x += tile_w) {
+                int startX = x;
+                int startY = y;
+                int endX = x + tile_w;
+                int endY = y + tile_h;
+
+                while (startX < endX) {
+                    bool empty = true;
+                    for (int i = startY; i < endY; ++i) {
+                        if (pixels[i * width + startX] != bg_color) {
+                            empty = false;
+                            break;
+                        }
+                    }
+                    if (!empty)
+                        break;
+                    ++startX;
+                }
+
+                while (startY < endY) {
+                    bool empty = true;
+                    for (int i = startX; i < endX; ++i) {
+                        if (pixels[startY * width + i] != bg_color) {
+                            empty = false;
+                            break;
+                        }
+                    }
+                    if (!empty)
+                        break;
+                    ++startY;
+                }
+
+                while (endX > startX) {
+                    bool empty = true;
+                    for (int i = startY; i < endY; ++i) {
+                        if (pixels[i * width + endX - 1] != bg_color) {
+                            empty = false;
+                            break;
+                        }
+                    }
+                    if (!empty)
+                        break;
+                    --endX;
+                }
+
+                while (endY > startY) {
+                    bool empty = true;
+                    for (int i = startX; i < endX; ++i) {
+                        if (pixels[(endY - 1) * width + i] != bg_color) {
+                            empty = false;
+                            break;
+                        }
+                    }
+                    if (!empty)
+                        break;
+                    --endY;
+                }
+
+                Glyph glyph;
+                glyph.rect = { startX, startY, endX - startX, endY - startY };
+                glyphs.push_back(glyph);
+            }
+        }
+        return true;
+    }
+
+    Font* get_font()
+    {
+        return &fmap.begin()->second;
+    }
+
+    BMPFontLoader(const BMPFontLoader&) = delete;
+    BMPFontLoader& operator=(const BMPFontLoader&) = delete;
+
+    BMPFontLoader& operator=(BMPFontLoader&& other) noexcept
+    {
+        if (this != &other) {
+            fmap = std::move(other.fmap);
+        }
+        return *this;
+    }
 };
 
+// For internal communication. XXX: currently no mechanism for
+// subscribers to unsubscribe.
 class EventEmitter {
 public:
     using Handler = std::function<void(SDL_Event&)>;
 
-    void subscribe(Uint32 event_type, Handler handler)
+    void subscribe(const Uint32 event_type, const Handler& handler)
     {
-        handlers[event_type].push_back(handler);
+        handlers[event_type].emplace_back(handler);
     }
 
     void emit(SDL_Event& event)
@@ -281,13 +713,13 @@ public:
         }
     }
 
-    void emit(InternalEventType::Type type)
+    void emit(const InternalEventType::Type type)
     {
         SDL_Event e = make_sdl_user_event(type, nullptr);
         emit(e);
     }
 
-    void emit(InternalEventType::Type type, void* data1)
+    void emit(const InternalEventType::Type type, void* data1)
     {
         SDL_Event e = make_sdl_user_event(type, data1);
         emit(e);
@@ -298,7 +730,7 @@ public:
         handlers.clear();
     }
 
-    static SDL_Event make_sdl_user_event(InternalEventType::Type type, void* data1)
+    static SDL_Event make_sdl_user_event(const InternalEventType::Type type, void* data1)
     {
         SDL_Event event;
         SDL_zero(event);
@@ -346,6 +778,7 @@ struct WidgetContext {
     SDL_Point& mouse_coord;
 };
 
+// TODO: needs work
 class Widget {
 public:
     Widget* parent;
@@ -379,18 +812,18 @@ public:
         return context.mouse_coord;
     }
 
-    void set_font(std::string file, int size)
+    void set_font(const std::string& file, const int size)
     {
         // XXX: check for error
         font = font->loader.open(file, size);
     }
 
-    void subscribe(Uint32 event_type, EventEmitter::Handler handler)
+    void subscribe(const Uint32 event_type, const EventEmitter::Handler handler)
     {
         emitter.subscribe(event_type, handler);
     }
 
-    void subscribe_global(Uint32 event_type, EventEmitter::Handler handler)
+    void subscribe_global(const Uint32 event_type, EventEmitter::Handler handler)
     {
         context.global_emitter->subscribe(event_type, handler);
     }
@@ -426,6 +859,7 @@ struct Prompt : public Widget {
         : Widget(parent)
     {
         input = &history.emplace_back(U"");
+        prompt_text = U"> ";
         // Create 1x1 texture for the cursor, it will be stretched to fit the font's line height and character width
         cursor_texture = SDL_CreateTexture(renderer(), SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STATIC, 1, 1);
         if (cursor_texture == nullptr)
@@ -480,8 +914,8 @@ struct Prompt : public Widget {
     void set_prompt(const std::u32string& str)
     {
         prompt_text = str;
-        entry.text = str + *input;
-        rebuild = true;
+        update_entry();
+        // rebuild = true;
     }
 
     /*
@@ -490,7 +924,7 @@ struct Prompt : public Widget {
      * will skip lines with zero length. The cursor is always set to the length of
      * the line's input.
      */
-    void set_input_from_history(ScrollDirection dir)
+    void set_input_from_history(const ScrollDirection dir)
     {
         size_t idx = history_idx;
         if (dir == ScrollDirection::up) {
@@ -570,10 +1004,12 @@ struct Prompt : public Widget {
     void update_entry()
     {
         std::u32string str = prompt_text + *input;
+        // entry.text = str;
+        // std::cerr << "Prompt update_entry(): " << to_utf8(str) << std::endl;
         make_logentry_lines(*this, entry, str);
     }
 
-    void render_cursor(int scroll_offset)
+    void render_cursor(const int scroll_offset)
     {
         if (entry.lines().empty())
             return;
@@ -601,7 +1037,7 @@ struct Prompt : public Widget {
         const auto cw = font->char_width;
         /*  full range of line + cursor */
         int cx = (cursor_len - line->start_index) * cw;
-        int cy = line->rect.y;
+        int cy = line->coord.y;
 
         SDL_Rect rect = { cx, cy, cw, lh };
         /* Draw the cursor */
@@ -615,27 +1051,32 @@ struct Prompt : public Widget {
     Prompt(const Prompt&) = delete;
     Prompt& operator=(const Prompt&) = delete;
 
-    LogEntry entry; // prompt may be line wrapped
+    // Holds wrapped lines from input
+    LogEntry entry;
+    // The text of the prompt itself.
     std::u32string prompt_text;
+    // The input portion of the prompt.
     std::u32string* input;
+    // Prompt text was changed flag
     bool rebuild { true };
-    size_t cursor { 0 }; /* position of cursor within a line */
-    /* 1x1 texture */
+    size_t cursor { 0 }; // position of cursor within an entry
+    // 1x1 texture stretched to font's single character dimensions
     SDL_Texture* cursor_texture;
-    /* For input history */
+    /*
+     * For input history.
+     * use deque to hold a stable reference.
+     */
     std::deque<std::u32string> history;
     int history_idx;
 };
 
 class Button : public Widget {
 public:
-    Button(Widget* parent, std::u32string label, SDL_Color color)
+    Button(Widget* parent, std::u32string& label, SDL_Color color)
         : Widget(parent)
         , label(label)
     {
-        texture = create_text_texture(*this, label, color);
-        SDL_QueryTexture(texture, NULL, NULL, &label_rect.w, &label_rect.h);
-
+        font->text_surface_size(label, label_rect.w, label_rect.h);
         subscribe_global(SDL_MOUSEBUTTONDOWN, [this](SDL_Event& e) {
             this->on_mouse_button_down(e.button);
         });
@@ -647,7 +1088,6 @@ public:
 
     ~Button()
     {
-        SDL_DestroyTexture(texture);
     }
 
     void on_mouse_button_down(SDL_MouseButtonEvent& e)
@@ -695,14 +1135,13 @@ public:
             set_draw_color(renderer(), colors::darkgray);
         }
 
-        render_texture(renderer(), texture, label_rect);
+        font->render(renderer(), label, label_rect.x, label_rect.y);
     }
 
     Button(const Button&) = delete;
     Button& operator=(const Button&) = delete;
 
     std::u32string label;
-    SDL_Texture* texture { nullptr };
     SDL_Rect label_rect {};
     bool depressed { false };
 };
@@ -719,7 +1158,7 @@ struct Toolbar : public Widget {
     void on_mouse_button_up(SDL_MouseButtonEvent& e);
     Toolbar(const Toolbar&) = delete;
     Toolbar& operator=(const Toolbar&) = delete;
-
+    // Should be changed to children and probably moved to base class
     std::deque<std::unique_ptr<Widget>> widgets;
 };
 
@@ -768,6 +1207,7 @@ struct InputLineWaiter {
             completed.wait(false);
             lock.lock();
             completed = false;
+            // Likely being shutdown
             if (input_q.empty()) {
                 // std::cerr << "input_q=empty()" << std::endl;
                 return 0;
@@ -785,6 +1225,7 @@ private:
 };
 
 struct LogScreen : public Widget {
+    // Use deque to hold a stable reference.
     std::deque<LogEntry> entries;
     Prompt prompt;
 
@@ -919,7 +1360,7 @@ struct LogScreen : public Widget {
         window_p.y -= viewport.y;
     }
 
-    void on_scroll(int y)
+    void on_scroll(const int y)
     {
         if (y > 0) {
             on_scroll(ScrollDirection::up);
@@ -956,25 +1397,27 @@ struct LogScreen : public Widget {
         num_lines = 0;
         prompt.on_resize();
         /*
-         * TODO: we probably don't need to re-render everything outside
+         * TODO: we probably don't need to rebuild everything outside
          * visible view.
-         * For large scrollback, the slowdown when resizing is noticable.
          */
         for (auto& e : entries) {
             update_entry(e);
         }
     }
 
-    void set_viewport(SDL_Rect new_viewport) override
+    void set_viewport(const SDL_Rect new_viewport) override
     {
         viewport_offset = { new_viewport.x, new_viewport.y };
         viewport = new_viewport;
         adjust_viewport();
     }
 
-    // Set viewport dimensions based on margin and font constraints.
-    // Viewport must support equally sized rows large enough to fit font height.
-    // Similarly, equally sized columns to fit font's char_width.
+    /*
+     * Set viewport dimensions based on margin and font constraints.
+     * For alignment, viewport must have equally sized rows large enough to
+     * fit font height. Similarly, equally sized columns to fit font width.
+     * We don't want partial rows and columns throwing off alignment.
+     */
     void adjust_viewport()
     {
         int margin = 4;
@@ -993,14 +1436,14 @@ struct LogScreen : public Widget {
         viewport.h = hfit;
     }
 
-    void on_new_output_line(std::u32string text)
+    void on_new_output_line(const std::u32string& text)
     {
         LogEntry& l = create_entry(EntryType::output, std::move(text));
         update_entry(l);
     }
 
     // TODO: cleanup, most of this belongs in Prompt
-    void on_new_input_line(const std::u32string text)
+    void on_new_input_line(const std::u32string& text)
     {
         auto both = prompt.prompt_text + text;
         auto& l = create_entry(EntryType::input, both);
@@ -1034,7 +1477,7 @@ struct LogScreen : public Widget {
     {
         entries.emplace_front(line_type, text);
 
-        /* When the list is too long, start chopping the tail off each new line */
+        /* When the list is too long, start chopping */
         if (num_lines >= max_lines) {
             num_lines -= entries.back().size;
             entries.pop_back();
@@ -1058,17 +1501,29 @@ struct LogScreen : public Widget {
 
             for (auto& line : entry.lines()) {
                 for (auto& rect : rects) {
-                    SDL_Point p = { rect.x, rect.y };
-                    if (SDL_PointInRect(&p, &line.rect)) {
-                        size_t start_x = line.start_index + (rect.x / font->char_width);
-                        size_t extent = (rect.w / font->char_width) + start_x;
-                        ret += entry.text.substr(start_x, std::min(extent - start_x, line.end_index - start_x));
+                    // std::cerr << "hirect: x=" << rect.x << ", y=" << rect.y << std::endl;
+                    // std::cerr << "linerect:" << to_utf8(line.text) << ", x=" << line.rect.x << ", y=" << line.rect.y << std::endl;
+                    if (rect.y == line.coord.y) {
+                        auto col = get_column(rect.x);
+                        auto extent = column_extent(rect.w) + col;
+                        ret += line.text.substr(col, std::min(extent - col, line.text.length() - col));
                     }
                 }
             }
         }
 
         SDL_SetClipboardText(to_utf8(ret).c_str());
+    }
+
+    size_t
+    get_column(const int x)
+    {
+        return x / font->char_width;
+    }
+
+    size_t column_extent(const int width)
+    {
+        return width / font->char_width;
     }
 
     int columns()
@@ -1094,49 +1549,39 @@ struct LogScreen : public Widget {
         SDL_RenderSetViewport(renderer(), &parent->viewport);
     }
 
-    // XXX: cleanup
     void render_lines()
     {
         const int max_row = rows() + scroll_offset;
         int ypos = viewport.h;
+        int row_counter = 0;
 
-        int cur_row = 0;
-        LogEntry& entry = prompt.entry;
-        for (auto it = entry.lines().rbegin(); it != entry.lines().rend(); ++it) {
-            cur_row++;
-            if (cur_row <= scroll_offset) {
-                continue;
-            }
-
-            auto& line = *it;
-            ypos -= line.rect.h;
-            // record y position of this line
-            line.rect.y = ypos;
-            render_texture(renderer(), line.texture, line.rect);
-        }
+        render_entry(prompt.entry, ypos, row_counter, max_row);
 
         if (entries.empty())
             return;
 
         for (auto& entry : entries) {
-            for (auto rit = entry.lines().rbegin(); rit != entry.lines().rend(); ++rit) {
-                cur_row++;
-                if (cur_row <= scroll_offset) {
-                    continue;
-                }
-
-                auto& line = *rit;
-                // record y position of this line
-                line.rect.y = ypos - line.rect.h;
-                render_texture(renderer(), line.texture, line.rect);
-                ypos -= line.rect.h;
-
-                if (cur_row > max_row)
-                    goto leave;
-            }
+            render_entry(entry, ypos, row_counter, max_row);
         }
-    leave:
-        return;
+    }
+
+    void render_entry(LogEntry& entry, int& ypos, int& row_counter, const int max_row)
+    {
+        // TODO: get rid of the reverse iterator
+        for (auto it = entry.lines().rbegin(); it != entry.lines().rend(); ++it) {
+            row_counter++;
+            if (row_counter <= scroll_offset) {
+                continue;
+            } else if (row_counter > max_row) {
+                return;
+            }
+
+            auto& line = *it;
+            ypos -= font->line_height;
+            // record y position of this line
+            line.coord.y = ypos;
+            font->render(renderer(), line.text, line.coord.x, line.coord.y);
+        }
     }
 
     void render_highlighted_lines()
@@ -1157,6 +1602,7 @@ struct LogScreen : public Widget {
     }
 
     // XXX: fix shimmering when going from bottom to top or right to left
+    // XXX: cleanup
     std::vector<SDL_Rect> get_highlighted_line_rects()
     {
         int char_width = font->char_width;
@@ -1234,7 +1680,7 @@ struct Window : public Widget {
     SDL_Point mouse_coord {}; // stores mouse position relative to window
     std::unique_ptr<Toolbar> toolbar; // optional toolbar. XXX: implementation requires it
     LogScreen log_screen;
-    Uint32 window_id;
+    Uint32 window_id; // Window id from SDL
     void render() {};
 
     Window(WindowContext winctx, Font* font, EventEmitter& emitter)
@@ -1324,6 +1770,7 @@ void Toolbar::render()
 
     // Lay out horizontally
     // TODO: don't calculate child widget offsets here
+    // TODO: rename to children, should be in base class
     for (auto& w : widgets) {
         w->viewport.x = x;
         x += w->viewport.w;
@@ -1384,7 +1831,7 @@ class ExternalEventWaiter {
                 if (status != State::active)
                     return;
                 queue.push(event);
-                notifier = true; /* Mutex may not be necessary, but extra paranoid! */
+                notifier = true;
             }
             notifier.notify_one();
         }
@@ -1494,13 +1941,19 @@ void make_logentry_lines(
     LogEntry& entry,
     std::u32string& text)
 {
+    struct Segment {
+        size_t start;
+        size_t end;
+    };
+
     entry.clear();
+    entry.text = text;
     // Break up the text into line segments, if needed
     int advance = widget.font->char_width;
     int delim_idx = 0; // last whitespace character for wrapping on word boundaries
     int start_idx = 0;
     int end_idx = 0;
-    std::vector<std::pair<int, int>> segments;
+    std::vector<Segment> segments;
     for (auto& ch : text) {
         if (ch == U'\n' || ch == U'\r') {
             // Not including the new line character
@@ -1509,22 +1962,21 @@ void make_logentry_lines(
                 segments.emplace_back(start_idx, end_idx);
             start_idx = end_idx + 1;
             delim_idx = 0;
+            // TODO: check for spaces properly?
         } else if (ch == U' ' || ch == U'\t') {
             delim_idx = end_idx;
-        } else {
             // check if width exceeded
-            if (((end_idx - start_idx + 1) * advance) >= widget.viewport.w) {
-                if (delim_idx) {
-                    // wrap at last whitespace
-                    segments.emplace_back(start_idx, delim_idx + 1);
-                    start_idx = delim_idx + 1;
-                } else {
-                    // wrap at last character
-                    segments.emplace_back(start_idx, end_idx + 1);
-                    start_idx = end_idx + 1;
-                }
-                delim_idx = 0;
+        } else if (((end_idx - start_idx + 1) * advance) >= widget.viewport.w) {
+            if (delim_idx) {
+                // wrap at last whitespace
+                segments.emplace_back(start_idx, delim_idx + 1);
+                start_idx = delim_idx + 1;
+            } else {
+                // wrap at last character
+                segments.emplace_back(start_idx, end_idx + 1);
+                start_idx = end_idx + 1;
             }
+            delim_idx = 0;
         }
 
         end_idx++;
@@ -1535,18 +1987,20 @@ void make_logentry_lines(
         segments.emplace_back(start_idx, std::u32string::npos);
     }
 
-    for (auto idx_pair : segments) {
-        if (idx_pair.second - idx_pair.first == 0) {
+    for (auto& seg : segments) {
+        if (seg.end - seg.start == 0) {
             // XXX: Sanity check.
             // std:cerr << "attempt to use empty segment" << endl;
             continue;
         }
-        // printf("Adding Line: '%s'\n", to_utf8(text.substr(idx_pair.first, idx_pair.second - idx_pair.first)).c_str());
-        SDL_Texture* texture = create_text_texture(widget, text.substr(idx_pair.first, idx_pair.second - idx_pair.first), colors::white);
-        entry.add_line(texture, idx_pair.first, idx_pair.second);
+        // std::cerr << "Adding line segment: " << idx_pair.first << "," << idx_pair.second << std::endl;
+        // std::u32string str = text.substr(seg.start, seg.end - seg.start);
+        auto v = std::u32string_view(entry.text).substr(seg.start, seg.end - seg.start);
+        entry.add_line(v, seg.start, seg.end);
     }
 }
-// TODO: handle errors properly
+// TODO: handle errors properly.  TODO: TTF not currently used, needs reworked to support font atlas.
+#if 0
 SDL_Texture* create_text_texture(Widget& widget, const std::u32string& text, const SDL_Color& color)
 {
     SDL_Surface* surface = TTF_RenderUTF8_Blended(widget.font->handle,
@@ -1564,16 +2018,18 @@ SDL_Texture* create_text_texture(Widget& widget, const std::u32string& text, con
 
     return texture;
 }
+#endif
 
 int on_sdl_event(void* data, SDL_Event* e);
 }
 
 using namespace console;
 
-/* Note: when an an SDL_EventFilter is set, SDL2 deletes all pending events */
 struct SDLEventFilterSetter {
     SDLEventFilterSetter(SDL_EventFilter filter, void* user_data)
     {
+        // Save the old filter so we can call it when
+        // we aren't handling an event.
         SDL_GetEventFilter(&saved_filter, &saved_user_data);
         SDL_SetEventFilter(filter, user_data);
     }
@@ -1608,14 +2064,22 @@ private:
 
 struct Console_con {
     struct Impl {
+        // For internal communication, mainly by widgets.
         EventEmitter internal_emitter;
         Window window;
+        // Opens and caches Font objects.
+        // A new Font object may be used when
+        // changing font size.
         std::unique_ptr<FontLoader> font_loader;
         SDL_Color bg_color; // not currently used
         SDL_Color font_color; // not currently used
+        // Used by GetLine() to wait for a new input line event.
         InputLineWaiter input_line_waiter;
         ExternalEventWaiter& external_event_waiter;
+        // Event Filter is how we currently receive events from SDL.
         SDLEventFilterSetter event_filter_setter;
+        // Stores the thread id of the thread used to create the console, which is also
+        // the thread responsible for rendering.
         std::thread::id render_thread_id;
 
         Impl(Console_con* con, WindowContext wctx, std::unique_ptr<FontLoader> fl, ExternalEventWaiter& external_event_waiter)
@@ -1633,9 +2097,6 @@ struct Console_con {
         ~Impl()
         {
             SDL_StopTextInput();
-            /* SDLEventFilter destructor resets event filter to saved event filter.
-             * SDL_DestroyWindow handled by Window destructor.
-             */
         }
     };
 
@@ -1662,7 +2123,7 @@ struct Console_con {
         return impl->window.log_screen;
     }
 
-    /* Stores SDL events and API tasks to be run on the render thread.
+    /* Queues SDL events and API tasks to later run on the render thread.
      * SDL events should be drained from it on shutdown.
      * API tasks should be drained as well, but just in case
      * we'll leave the storage in place after destroy(),
@@ -1671,7 +2132,10 @@ struct Console_con {
     ExternalEventWaiter external_event_waiter;
     std::atomic<State> status { State::active };
     std::unique_ptr<Impl> impl;
+    // Protects access to data such as rows() and column()
+    // information fetched from API functions.
     std::mutex mutex;
+    // These mutexes are only relevant during shutdown.
     std::mutex getline_inproc_mutex;
     std::mutex on_sdl_event_inproc_mutex;
 };
@@ -1714,15 +2178,14 @@ int on_sdl_event(void* data, SDL_Event* e)
     std::scoped_lock l(con->on_sdl_event_inproc_mutex);
 
     /*
-     * If shutting down then it isn't safe to continue further.
-     * This check is likely unnecessary (needs testing) since
-     * SDL drains pending events when the event filter is removed.
+     * If shutting down then it isn't safe to continue further..
      */
     if (con->is_shuttingdown())
-        return 1;
+        return con->impl->event_filter_setter.maybe_call_saved(data, e);
 
+    // XXX: needs work
     if (e->type == SDL_WINDOWEVENT && e->window.windowID != con->impl->window.window_id) {
-        return 1;
+        return con->impl->event_filter_setter.maybe_call_saved(data, e);
     } else {
 
         // TODO: Check for Window specific events targeting our window, if not,
@@ -1756,13 +2219,24 @@ Console_Create(const char* title,
         WindowContext wctx = Window::create(title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
             640, 480,
             SDL_WINDOW_RESIZABLE);
+        auto font_loader = std::make_unique<BMPFontLoader>();
+        auto bmpfont = font_loader->open("test.bmp", 14);
+        if (!bmpfont)
+            std::cerr << "Failed to open font: " << SDL_GetError() << std::endl;
 
+        bmpfont->texture = SDL_CreateTextureFromSurface(wctx.renderer, bmpfont->surface);
+        if (!bmpfont->texture) {
+            std::cerr << "SDL_CreateTextureFromSurface Error: " << SDL_GetError() << std::endl;
+        }
+        SDL_SetTextureBlendMode(bmpfont->texture, SDL_BLENDMODE_BLEND);
+
+        /*
         auto font_loader = std::make_unique<FontLoader>();
         auto font = font_loader->open("source_code_pro.ttf", font_size);
         if (font == nullptr) {
             std::cerr << "error initializing TTF: " << TTF_GetError();
             return nullptr;
-        }
+        }*/
 
         Console_con* con = &num_con[0];
         con->init(wctx, std::move(font_loader));
@@ -1815,7 +2289,7 @@ void Console_SetPrompt(Console_con* con,
     const char* prompt)
 {
     auto str = from_utf8(prompt);
-    con->impl->external_event_waiter.api.push([con, str = std::move(str)] {
+    con->external_event_waiter.api.push([con, str = std::move(str)] {
         con->lscreen().prompt.set_prompt(str);
     });
 }
@@ -1855,6 +2329,8 @@ int Console_MainLoop(Console_con* con)
             }
             break;
         }
+
+        SDL_Delay(50);
     }
     return 0;
 }
@@ -1862,7 +2338,7 @@ int Console_MainLoop(Console_con* con)
 void Console_AddLine(Console_con* con, const char* s)
 {
     auto str = from_utf8(s);
-    con->impl->external_event_waiter.api.push([con, str = std::move(str)] {
+    con->external_event_waiter.api.push([con, str = std::move(str)] {
         con->lscreen().on_new_output_line(str);
     });
 }
@@ -1893,7 +2369,7 @@ int Console_GetRows(Console_con* con)
 
 void Console_Clear(Console_con* con)
 {
-    con->impl->external_event_waiter.api.push([con] {
+    con->external_event_waiter.api.push([con] {
         con->lscreen().entries.clear();
     });
 }
@@ -1903,7 +2379,7 @@ void Console_Shutdown(Console_con* con)
     assert(con);
     con->status = State::shutdown;
     // Must push an event to wake up the main render thread
-    con->impl->external_event_waiter.api.push([] {});
+    con->external_event_waiter.api.push([] {});
 }
 
 // XXX: cleanup properly
