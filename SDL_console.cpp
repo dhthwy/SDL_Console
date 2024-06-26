@@ -1,15 +1,13 @@
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_error.h>
 #include <SDL2/SDL_events.h>
-#include <SDL2/SDL_ttf.h>
+#include <SDL2/SDL_image.h>
 #include <algorithm>
 #include <assert.h>
 #include <atomic>
-// #include <codecvt>
 #include <cstring>
 #include <functional>
 #include <iostream>
-// #include <locale>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -22,7 +20,131 @@
 
 #include "SDL_console.h"
 
+#define CONSOLE_SDL_LINK_AT_RUNTIME 1
 namespace console {
+
+#if defined(CONSOLE_SDL_LINK_AT_RUNTIME) && (CONSOLE_SDL_LINK_AT_RUNTIME) == 1
+#define CONSOLE_SYMBOL_ADDR(sym) nullptr
+#else
+#define CONSOLE_SYMBOL_ADDR(sym) ::sym
+#endif
+
+#define CONSOLE_DEFINE_SYMBOL(sym) decltype(sym)* sym = CONSOLE_SYMBOL_ADDR(sym)
+
+CONSOLE_DEFINE_SYMBOL(SDL_ConvertSurfaceFormat);
+CONSOLE_DEFINE_SYMBOL(SDL_CreateRenderer);
+CONSOLE_DEFINE_SYMBOL(SDL_CreateRGBSurface);
+CONSOLE_DEFINE_SYMBOL(SDL_CreateTexture);
+CONSOLE_DEFINE_SYMBOL(SDL_CreateTextureFromSurface);
+CONSOLE_DEFINE_SYMBOL(SDL_CreateWindow);
+CONSOLE_DEFINE_SYMBOL(SDL_DestroyRenderer);
+CONSOLE_DEFINE_SYMBOL(SDL_DestroyTexture);
+CONSOLE_DEFINE_SYMBOL(SDL_DestroyWindow);
+CONSOLE_DEFINE_SYMBOL(SDL_free);
+CONSOLE_DEFINE_SYMBOL(SDL_GetClipboardText);
+CONSOLE_DEFINE_SYMBOL(SDL_GetError);
+CONSOLE_DEFINE_SYMBOL(SDL_GetEventFilter);
+CONSOLE_DEFINE_SYMBOL(SDL_GetModState);
+CONSOLE_DEFINE_SYMBOL(SDL_GetRendererOutputSize);
+CONSOLE_DEFINE_SYMBOL(SDL_GetWindowFlags);
+CONSOLE_DEFINE_SYMBOL(SDL_GetWindowID);
+CONSOLE_DEFINE_SYMBOL(SDL_HideWindow);
+CONSOLE_DEFINE_SYMBOL(SDL_iconv_string);
+CONSOLE_DEFINE_SYMBOL(SDL_InitSubSystem);
+CONSOLE_DEFINE_SYMBOL(SDL_MapRGB);
+CONSOLE_DEFINE_SYMBOL(SDL_memset);
+CONSOLE_DEFINE_SYMBOL(SDL_RenderClear);
+CONSOLE_DEFINE_SYMBOL(SDL_RenderCopy);
+CONSOLE_DEFINE_SYMBOL(SDL_RenderDrawRect);
+CONSOLE_DEFINE_SYMBOL(SDL_RenderFillRect);
+CONSOLE_DEFINE_SYMBOL(SDL_RenderPresent);
+CONSOLE_DEFINE_SYMBOL(SDL_RenderSetIntegerScale);
+CONSOLE_DEFINE_SYMBOL(SDL_RenderSetViewport);
+CONSOLE_DEFINE_SYMBOL(SDL_PointInRect);
+CONSOLE_DEFINE_SYMBOL(SDL_SetClipboardText);
+CONSOLE_DEFINE_SYMBOL(SDL_SetColorKey);
+CONSOLE_DEFINE_SYMBOL(SDL_SetEventFilter);
+CONSOLE_DEFINE_SYMBOL(SDL_SetHint);
+CONSOLE_DEFINE_SYMBOL(SDL_SetRenderDrawColor);
+CONSOLE_DEFINE_SYMBOL(SDL_SetTextureBlendMode);
+CONSOLE_DEFINE_SYMBOL(SDL_SetTextureColorMod);
+CONSOLE_DEFINE_SYMBOL(SDL_SetWindowMinimumSize);
+CONSOLE_DEFINE_SYMBOL(SDL_ShowWindow);
+CONSOLE_DEFINE_SYMBOL(SDL_StartTextInput);
+CONSOLE_DEFINE_SYMBOL(SDL_StopTextInput);
+CONSOLE_DEFINE_SYMBOL(SDL_UpperBlit);
+CONSOLE_DEFINE_SYMBOL(SDL_UpdateTexture);
+CONSOLE_DEFINE_SYMBOL(SDL_QuitSubSystem);
+
+struct Symbol {
+    const char* name;
+    void** addr;
+};
+
+using SymbolResolverProc = void* (*)(const char*);
+void resolve_symbols(SymbolResolverProc resolver)
+{
+
+#define ADD_SYMBOL(sym)             \
+    {                               \
+        #sym, (void**)&console::sym \
+    }
+
+    /* This list must match with CONSOLE_DEFINE_SYMBOL 1:1 */
+
+    std::vector<Symbol> symbols = {
+        ADD_SYMBOL(SDL_ConvertSurfaceFormat),
+        ADD_SYMBOL(SDL_CreateRenderer),
+        ADD_SYMBOL(SDL_CreateRGBSurface),
+        ADD_SYMBOL(SDL_CreateTexture),
+        ADD_SYMBOL(SDL_CreateTextureFromSurface),
+        ADD_SYMBOL(SDL_CreateWindow),
+        ADD_SYMBOL(SDL_DestroyRenderer),
+        ADD_SYMBOL(SDL_DestroyTexture),
+        ADD_SYMBOL(SDL_DestroyWindow),
+        ADD_SYMBOL(SDL_free),
+        ADD_SYMBOL(SDL_GetClipboardText),
+        ADD_SYMBOL(SDL_GetError),
+        ADD_SYMBOL(SDL_GetEventFilter),
+        ADD_SYMBOL(SDL_GetModState),
+        ADD_SYMBOL(SDL_GetRendererOutputSize),
+        ADD_SYMBOL(SDL_GetWindowFlags),
+        ADD_SYMBOL(SDL_GetWindowID),
+        ADD_SYMBOL(SDL_HideWindow),
+        ADD_SYMBOL(SDL_iconv_string),
+        ADD_SYMBOL(SDL_InitSubSystem),
+        ADD_SYMBOL(SDL_MapRGB),
+        ADD_SYMBOL(SDL_memset),
+        ADD_SYMBOL(SDL_RenderClear),
+        ADD_SYMBOL(SDL_RenderCopy),
+        ADD_SYMBOL(SDL_RenderDrawRect),
+        ADD_SYMBOL(SDL_RenderFillRect),
+        ADD_SYMBOL(SDL_RenderPresent),
+        ADD_SYMBOL(SDL_RenderSetIntegerScale),
+        ADD_SYMBOL(SDL_RenderSetViewport),
+        ADD_SYMBOL(SDL_PointInRect),
+        ADD_SYMBOL(SDL_SetClipboardText),
+        ADD_SYMBOL(SDL_SetColorKey),
+        ADD_SYMBOL(SDL_SetEventFilter),
+        ADD_SYMBOL(SDL_SetHint),
+        ADD_SYMBOL(SDL_SetRenderDrawColor),
+        ADD_SYMBOL(SDL_SetTextureBlendMode),
+        ADD_SYMBOL(SDL_SetTextureColorMod),
+        ADD_SYMBOL(SDL_SetWindowMinimumSize),
+        ADD_SYMBOL(SDL_ShowWindow),
+        ADD_SYMBOL(SDL_StartTextInput),
+        ADD_SYMBOL(SDL_StopTextInput),
+        ADD_SYMBOL(SDL_UpperBlit),
+        ADD_SYMBOL(SDL_UpdateTexture),
+        ADD_SYMBOL(SDL_QuitSubSystem)
+    };
+#undef ADD_SYMBOL
+
+    for (auto& sym : symbols) {
+        *sym.addr = resolver(sym.name);
+    }
+}
+
 static constexpr size_t default_scrollback = 1024;
 
 #if 0
@@ -53,12 +175,12 @@ static std::string to_utf8(const std::u32string& s)
     // Not sure how safe this is.
     const char* p = reinterpret_cast<const char*>(s.c_str());
     // Need to make room for utf8 + terminating null, so can't use character count here..
-    char* conv_bytes = SDL_iconv_string("UTF-8", "UTF32", p, (s.length() + 1) * sizeof(char32_t));
+    char* conv_bytes = console::SDL_iconv_string("UTF-8", "UTF32", p, (s.length() + 1) * sizeof(char32_t));
     if (!conv_bytes)
         return "";
 
     std::string result = conv_bytes;
-    SDL_free(conv_bytes);
+    console::SDL_free(conv_bytes);
     return result;
 }
 
@@ -340,6 +462,8 @@ struct Font {
         , char_width(char_width)
         , line_height(line_height)
     {
+        this->char_width = 8;
+        this->line_height = 12;
     }
 
     ~Font()
@@ -349,7 +473,7 @@ struct Font {
     // TODO: scaling
     void render(SDL_Renderer* renderer, const std::u32string_view& text, int x, int y)
     {
-        // int scale = 1;
+        float scale = 1;
         for (auto& ch : text) {
             char32_t index;
             if (ch <= 127)
@@ -358,11 +482,11 @@ struct Font {
                 index = unicode_glyph_index(ch);
             }
             Glyph& g = glyphs[index];
-            //  int x = (x + g.rect.w/2) - (g.rect.w/2 * scale);
-            //  int y = (y + g.rect.h/2) - (g.rect.h/2 * scale);
-            SDL_Rect dst = { x, y, g.rect.w, g.rect.h };
+            //            int nx = (x + g.rect.w / 2) - (g.rect.w / 2 * scale);
+            //          int ny = (y + g.rect.h / 2) - (g.rect.h / 2 * scale);
+            SDL_Rect dst = { x, y, static_cast<int>(g.rect.w * scale), static_cast<int>(g.rect.h * scale) };
             x += g.rect.w;
-            SDL_RenderCopy(renderer, texture, &g.rect, &dst);
+            console::SDL_RenderCopy(renderer, texture, &g.rect, &dst);
         }
     }
 
@@ -574,25 +698,32 @@ struct BMPFontLoader : public FontLoader {
             return &it->second;
         }
 
-        SDL_Surface* glyph_surface = SDL_LoadBMP(path.c_str());
+        // SDL_Surface* glyph_surface = SDL_LoadBMP(path.c_str());
+        SDL_Surface* glyph_surface = IMG_Load(path.c_str());
         if (glyph_surface == nullptr) {
             return nullptr;
         }
 
-        SDL_ConvertSurfaceFormat(glyph_surface, SDL_PIXELFORMAT_RGBA32, 0);
-        Uint32 bg_color = SDL_MapRGB(glyph_surface->format, 255, 0, 255);
-        SDL_SetColorKey(glyph_surface, SDL_TRUE, bg_color);
+        console::SDL_ConvertSurfaceFormat(glyph_surface, SDL_PIXELFORMAT_RGBA32, 0);
+        //  XXX: hardcoded magenta
+        Uint32 bg_color = console::SDL_MapRGB(glyph_surface->format, 255, 0, 255);
+        console::SDL_SetColorKey(glyph_surface, SDL_TRUE, bg_color);
 
         std::vector<Glyph> glyphs;
         extract_glyphs(glyph_surface, bg_color, 16, 16, glyphs);
 
-        // TODO: don't hard code
-        // add additional width if needed to adjust spacing between characters
-        int char_width = 8;
-        // add additional height if needed to adjust spacing between lines
-        int line_height = 14;
+        // Alpha mask needs setting. FIXME: shouldn't to create a new surface?
+        SDL_Surface* glyph_surface2 = console::SDL_CreateRGBSurface(0, glyph_surface->w, glyph_surface->h, 32,
+            0xFF000000, 0x00FF0000, 0x0000FF00, 0x000000FF);
+        if (!glyph_surface2)
+            return nullptr;
 
-        auto result = fmap.emplace(key, Font(*this, glyph_surface, glyphs, char_width, line_height));
+        console::SDL_BlitSurface(glyph_surface, NULL, glyph_surface2, NULL);
+
+        console::SDL_FreeSurface(glyph_surface);
+        // TODO: don't hard code
+
+        auto result = fmap.emplace(key, Font(*this, glyph_surface2, glyphs, 0, 0));
         return &result.first->second;
     }
 
@@ -733,7 +864,7 @@ public:
     static SDL_Event make_sdl_user_event(const InternalEventType::Type type, void* data1)
     {
         SDL_Event event;
-        SDL_zero(event);
+        console::SDL_zero(event);
         event.type = type;
         event.user.data1 = data1;
         return event;
@@ -861,15 +992,15 @@ struct Prompt : public Widget {
         input = &history.emplace_back(U"");
         prompt_text = U"> ";
         // Create 1x1 texture for the cursor, it will be stretched to fit the font's line height and character width
-        cursor_texture = SDL_CreateTexture(renderer(), SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STATIC, 1, 1);
+        cursor_texture = console::SDL_CreateTexture(renderer(), SDL_PIXELFORMAT_RGBA8888, SDL_TEXTUREACCESS_STATIC, 1, 1);
         if (cursor_texture == nullptr)
-            throw(std::runtime_error(SDL_GetError()));
+            throw(std::runtime_error(console::SDL_GetError()));
 
         // FFFFFF = rgb white, 7F = 50% transparant
         Uint32 pixel = 0xFFFFFF7F;
-        SDL_UpdateTexture(cursor_texture, NULL, &pixel, sizeof(Uint32));
+        console::SDL_UpdateTexture(cursor_texture, NULL, &pixel, sizeof(Uint32));
         // For transparancy
-        SDL_SetTextureBlendMode(cursor_texture, SDL_BLENDMODE_BLEND);
+        console::SDL_SetTextureBlendMode(cursor_texture, SDL_BLENDMODE_BLEND);
 
         subscribe_global(SDL_KEYDOWN, [this](SDL_Event& e) {
             on_key_down(e.key);
@@ -882,7 +1013,7 @@ struct Prompt : public Widget {
 
     ~Prompt()
     {
-        SDL_DestroyTexture(cursor_texture);
+        console::SDL_DestroyTexture(cursor_texture);
     }
 
     void on_key_down(const SDL_KeyboardEvent& e)
@@ -915,7 +1046,6 @@ struct Prompt : public Widget {
     {
         prompt_text = str;
         update_entry();
-        // rebuild = true;
     }
 
     /*
@@ -1126,12 +1256,12 @@ public:
         SDL_Point coord = mouse_coord();
         if (depressed) {
             set_draw_color(renderer(), colors::lightgray);
-            SDL_RenderFillRect(renderer(), &viewport);
+            console::SDL_RenderFillRect(renderer(), &viewport);
             // SDL_RenderDrawRect(ui.renderer, &w.rect);
             set_draw_color(renderer(), colors::darkgray);
         } else if (in_rect(coord, viewport)) {
             set_draw_color(renderer(), colors::lightgray);
-            SDL_RenderDrawRect(renderer(), &viewport);
+            console::SDL_RenderDrawRect(renderer(), &viewport);
             set_draw_color(renderer(), colors::darkgray);
         }
 
@@ -1279,14 +1409,14 @@ struct LogScreen : public Widget {
             break;
         /* copy */
         case SDLK_c:
-            if (SDL_GetModState() & KMOD_CTRL) {
+            if (console::SDL_GetModState() & KMOD_CTRL) {
                 on_set_clipboard_text();
             }
             break;
 
         /* paste */
         case SDLK_v:
-            if (SDL_GetModState() & KMOD_CTRL) {
+            if (console::SDL_GetModState() & KMOD_CTRL) {
                 on_get_clipboard_text();
             }
             break;
@@ -1314,10 +1444,10 @@ struct LogScreen : public Widget {
 
     void on_get_clipboard_text()
     {
-        auto* str = SDL_GetClipboardText();
+        auto* str = console::SDL_GetClipboardText();
         if (*str != '\0')
             prompt.add_input(from_utf8(str));
-        SDL_free(str);
+        console::SDL_free(str);
     }
 
     void on_mouse_button_down(SDL_MouseButtonEvent& e)
@@ -1512,7 +1642,7 @@ struct LogScreen : public Widget {
             }
         }
 
-        SDL_SetClipboardText(to_utf8(ret).c_str());
+        console::SDL_SetClipboardText(to_utf8(ret).c_str());
     }
 
     size_t
@@ -1538,15 +1668,17 @@ struct LogScreen : public Widget {
 
     void render() override
     {
-        SDL_RenderSetViewport(renderer(), &viewport);
+        console::SDL_RenderSetViewport(renderer(), &viewport);
         prompt.maybe_rebuild();
         // TODO: make sure renderer supports blending else highlighting
         // will make the text invisible
         render_highlighted_lines();
+        // SDL_SetTextureColorMod(font->texture, 0, 128, 0);
         render_lines();
-        // Prompt input rendering is done in render_lines()
+        // SDL_SetTextureColorMod(font->texture, 255, 255, 255);
+        //  Prompt input rendering is done in render_lines()
         prompt.render_cursor(scroll_offset);
-        SDL_RenderSetViewport(renderer(), &parent->viewport);
+        console::SDL_RenderSetViewport(renderer(), &parent->viewport);
     }
 
     void render_lines()
@@ -1555,6 +1687,7 @@ struct LogScreen : public Widget {
         int ypos = viewport.h;
         int row_counter = 0;
 
+        // SDL_RenderSetScale(renderer(), 1.5, 1.5);
         render_entry(prompt.entry, ypos, row_counter, max_row);
 
         if (entries.empty())
@@ -1563,6 +1696,7 @@ struct LogScreen : public Widget {
         for (auto& entry : entries) {
             render_entry(entry, ypos, row_counter, max_row);
         }
+        // SDL_RenderSetScale(renderer(), 1.0, 1.0);
     }
 
     void render_entry(LogEntry& entry, int& ypos, int& row_counter, const int max_row)
@@ -1577,8 +1711,10 @@ struct LogScreen : public Widget {
             }
 
             auto& line = *it;
+            // ypos -= font->line_height * scale_factor
             ypos -= font->line_height;
             // record y position of this line
+            // line.coord.y = ypos / scale_factor
             line.coord.y = ypos;
             font->render(renderer(), line.text, line.coord.x, line.coord.y);
         }
@@ -1596,7 +1732,7 @@ struct LogScreen : public Widget {
         set_draw_color(renderer(), colors::mediumgray);
         for (auto& rect : rects) {
 
-            SDL_RenderFillRect(renderer(), &rect);
+            console::SDL_RenderFillRect(renderer(), &rect);
         }
         set_draw_color(renderer(), colors::darkgray);
     }
@@ -1689,7 +1825,7 @@ struct Window : public Widget {
         , handle(winctx.handle)
         , log_screen(this)
     {
-        window_id = SDL_GetWindowID(handle);
+        window_id = console::SDL_GetWindowID(handle);
         if (window_id == 0)
             throw(std::runtime_error(SDL_GetError()));
 
@@ -1704,8 +1840,8 @@ struct Window : public Widget {
             mouse_coord.y = e.button.y;
         });
 
-        SDL_SetWindowMinimumSize(handle, 64, 48);
-        SDL_RenderSetIntegerScale(renderer(), SDL_TRUE);
+        console::SDL_SetWindowMinimumSize(handle, 64, 48);
+        console::SDL_RenderSetIntegerScale(renderer(), SDL_TRUE);
 
         toolbar = std::make_unique<Toolbar>(this);
 
@@ -1716,36 +1852,36 @@ struct Window : public Widget {
     ~Window()
     {
         if (renderer()) {
-            SDL_DestroyRenderer(renderer());
+            console::SDL_DestroyRenderer(renderer());
         }
         if (handle) {
-            SDL_DestroyWindow(handle);
+            console::SDL_DestroyWindow(handle);
         }
     }
 
     void on_resize() override
     {
-        SDL_GetRendererOutputSize(renderer(), &viewport.w, &viewport.h);
-        SDL_RenderSetViewport(renderer(), &viewport);
+        console::SDL_GetRendererOutputSize(renderer(), &viewport.w, &viewport.h);
+        console::SDL_RenderSetViewport(renderer(), &viewport);
         toolbar->on_resize();
         log_screen.on_resize();
     }
 
     static WindowContext create(const char* title, int x, int y, int w, int h, Uint32 flags)
     {
-        SDL_Window* handle = SDL_CreateWindow(title, x, y, w, h, flags);
+        SDL_Window* handle = console::SDL_CreateWindow(title, x, y, w, h, flags);
         if (!handle) {
             throw std::runtime_error("Failed to create SDL window");
         }
 
-        SDL_Renderer* renderer = SDL_CreateRenderer(handle, -1, SDL_RENDERER_ACCELERATED);
+        SDL_Renderer* renderer = console::SDL_CreateRenderer(handle, -1, SDL_RENDERER_ACCELERATED);
         if (!renderer) {
-            SDL_DestroyWindow(handle);
+            console::SDL_DestroyWindow(handle);
             throw std::runtime_error("Failed to create SDL renderer");
         }
 
         SDL_Rect rect = {};
-        SDL_GetRendererOutputSize(renderer, &rect.w, &rect.h);
+        console::SDL_GetRendererOutputSize(renderer, &rect.w, &rect.h);
         return WindowContext(handle, renderer, rect);
     }
 
@@ -1763,7 +1899,7 @@ void Toolbar::render()
     // Render bg
     // SDL_RenderFillRect(renderer(), &viewport);
     // Draw a border
-    SDL_RenderDrawRect(renderer(), &viewport);
+    console::SDL_RenderDrawRect(renderer(), &viewport);
 
     int margin_right = font->char_width;
     int x = (parent->viewport.w - margin_right) - compute_widgets_startx();
@@ -1918,7 +2054,7 @@ bool in_rect(int x, int y, SDL_Rect& r)
 
 bool in_rect(SDL_Point& p, SDL_Rect& r)
 {
-    return SDL_PointInRect(&p, &r);
+    return console::SDL_PointInRect(&p, &r);
 }
 
 void render_texture(
@@ -1926,12 +2062,12 @@ void render_texture(
     SDL_Texture* texture,
     const SDL_Rect& dst)
 {
-    SDL_RenderCopy(renderer, texture, NULL, &dst);
+    console::SDL_RenderCopy(renderer, texture, NULL, &dst);
 }
 
 int set_draw_color(SDL_Renderer* renderer, const SDL_Color& color)
 {
-    return SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
+    return console::SDL_SetRenderDrawColor(renderer, color.r, color.g, color.b, color.a);
 }
 
 // Used by Prompt and LogScreen
@@ -2030,8 +2166,8 @@ struct SDLEventFilterSetter {
     {
         // Save the old filter so we can call it when
         // we aren't handling an event.
-        SDL_GetEventFilter(&saved_filter, &saved_user_data);
-        SDL_SetEventFilter(filter, user_data);
+        console::SDL_GetEventFilter(&saved_filter, &saved_user_data);
+        console::SDL_SetEventFilter(filter, user_data);
     }
 
     ~SDLEventFilterSetter()
@@ -2039,13 +2175,13 @@ struct SDLEventFilterSetter {
         // reset_saved() gets called on shutdown but in the event
         // something very bad happened, do it here.
         if (!did_reset_saved)
-            SDL_SetEventFilter(saved_filter, saved_user_data);
+            console::SDL_SetEventFilter(saved_filter, saved_user_data);
     }
 
     void reset_saved()
     {
         did_reset_saved = true;
-        SDL_SetEventFilter(saved_filter, saved_user_data);
+        console::SDL_SetEventFilter(saved_filter, saved_user_data);
     }
 
     int maybe_call_saved(void* user_data, SDL_Event* e)
@@ -2091,12 +2227,12 @@ struct Console_con {
             , render_thread_id(std::this_thread::get_id())
         {
             external_event_waiter.reset();
-            SDL_StartTextInput();
+            console::SDL_StartTextInput();
         };
 
         ~Impl()
         {
-            SDL_StopTextInput();
+            console::SDL_StopTextInput();
         }
     };
 
@@ -2149,7 +2285,7 @@ int render_frame(Console_con::Impl* impl)
     assert(impl);
 
     // Should not fail unless memory starvation.
-    SDL_RenderClear(impl->window.renderer());
+    console::SDL_RenderClear(impl->window.renderer());
 
     //  set background color
     // Should not fail unless renderer is invalid
@@ -2161,7 +2297,7 @@ int render_frame(Console_con::Impl* impl)
 
     impl->window.log_screen.render();
 
-    SDL_RenderPresent(impl->window.renderer());
+    console::SDL_RenderPresent(impl->window.renderer());
 
     return 0;
 }
@@ -2177,30 +2313,24 @@ int on_sdl_event(void* data, SDL_Event* e)
     auto con = static_cast<Console_con*>(data);
     std::scoped_lock l(con->on_sdl_event_inproc_mutex);
 
-    /*
-     * If shutting down then it isn't safe to continue further..
-     */
-    if (con->is_shuttingdown())
-        return con->impl->event_filter_setter.maybe_call_saved(data, e);
+    const Uint32 flags = console::SDL_GetWindowFlags(con->impl->window.handle);
+    if ((e->type == SDL_WINDOWEVENT && e->window.windowID != con->impl->window.window_id)
+        || !(flags & SDL_WINDOW_INPUT_FOCUS)
+        || e->type == SDL_USEREVENT) {
 
-    // XXX: needs work
-    if (e->type == SDL_WINDOWEVENT && e->window.windowID != con->impl->window.window_id) {
         return con->impl->event_filter_setter.maybe_call_saved(data, e);
-    } else {
-
-        // TODO: Check for Window specific events targeting our window, if not,
-        // fallback to SDL_GetWindowFlags() and possibly SDL_GetMouseFocus()
-        const Uint32 flags = SDL_GetWindowFlags(con->impl->window.handle);
-        if (!(flags & SDL_WINDOW_INPUT_FOCUS)) {
-            return con->impl->event_filter_setter.maybe_call_saved(data, e);
-        }
     }
 
     SDL_Event ec;
     std::memcpy(&ec, e, sizeof(SDL_Event));
-    con->impl->external_event_waiter.sdl.push(ec);
+    con->external_event_waiter.sdl.push(ec);
     return 0;
 }
+}
+
+void Console_Init(void* (*resolver)(const char*))
+{
+    resolve_symbols(resolver);
 }
 
 // XXX: cleanup
@@ -2210,8 +2340,8 @@ Console_Create(const char* title,
     const int font_size)
 
 {
-    if (SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
-        std::cerr << "SDL failed to init: " << SDL_GetError();
+    if (console::SDL_InitSubSystem(SDL_INIT_VIDEO) != 0) {
+        std::cerr << "SDL failed to init: " << console::SDL_GetError();
         return nullptr;
     }
 
@@ -2219,16 +2349,21 @@ Console_Create(const char* title,
         WindowContext wctx = Window::create(title, SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
             640, 480,
             SDL_WINDOW_RESIZABLE);
-        auto font_loader = std::make_unique<BMPFontLoader>();
-        auto bmpfont = font_loader->open("test.bmp", 14);
-        if (!bmpfont)
-            std::cerr << "Failed to open font: " << SDL_GetError() << std::endl;
 
-        bmpfont->texture = SDL_CreateTextureFromSurface(wctx.renderer, bmpfont->surface);
+        // SDL_RenderSetLogicalSize(wctx.renderer, 384, 216);
+
+        auto font_loader = std::make_unique<BMPFontLoader>();
+        auto bmpfont = font_loader->open("test.png", 14);
+        if (!bmpfont)
+            std::cerr << "Failed to open font: " << console::SDL_GetError() << std::endl;
+
+        console::SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "best");
+        // SDL_RenderSetScale(wctx.renderer, 0.5, 0.5);
+        bmpfont->texture = console::SDL_CreateTextureFromSurface(wctx.renderer, bmpfont->surface);
         if (!bmpfont->texture) {
-            std::cerr << "SDL_CreateTextureFromSurface Error: " << SDL_GetError() << std::endl;
+            std::cerr << "SDL_CreateTextureFromSurface Error: " << console::SDL_GetError() << std::endl;
         }
-        SDL_SetTextureBlendMode(bmpfont->texture, SDL_BLENDMODE_BLEND);
+        console::SDL_SetTextureBlendMode(bmpfont->texture, SDL_BLENDMODE_BLEND);
 
         /*
         auto font_loader = std::make_unique<FontLoader>();
@@ -2279,7 +2414,7 @@ Console_Create(const char* title,
 
         return con;
     } catch (std::runtime_error& e) {
-        SDL_QuitSubSystem(SDL_INIT_VIDEO);
+        console::SDL_QuitSubSystem(SDL_INIT_VIDEO);
         std::cerr << e.what() << std::endl;
         return nullptr;
     }
@@ -2394,7 +2529,7 @@ bool Console_Destroy(Console_con* con)
 
     con->status = State::inactive;
     con->impl.reset();
-    SDL_QuitSubSystem(SDL_INIT_VIDEO);
+    console::SDL_QuitSubSystem(SDL_INIT_VIDEO);
     return true;
 }
 
@@ -2410,8 +2545,22 @@ int Console_GetLine(Console_con* con, std::string& buf)
 
 void Console_SetScrollback(Console_con* con, const int lines)
 {
-    con->impl->external_event_waiter.api.push([con, lines = lines] {
+    con->external_event_waiter.api.push([con, lines = lines] {
         con->lscreen().max_lines = lines;
+    });
+}
+
+void Console_ShowWindow(Console_con* con)
+{
+    con->external_event_waiter.api.push([con] {
+        console::SDL_ShowWindow(con->impl->window.handle);
+    });
+}
+
+void Console_HideWindow(Console_con* con)
+{
+    con->external_event_waiter.api.push([con] {
+        console::SDL_HideWindow(con->impl->window.handle);
     });
 }
 

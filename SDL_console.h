@@ -12,6 +12,9 @@ typedef struct _console_color {
 } Console_Color;
 
 extern "C" {
+
+void Console_Init(void* (*resolver)(const char*));
+
 Console_con*
 Console_Create(const char* title,
     const char* prompt,
