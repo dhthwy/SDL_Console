@@ -13,7 +13,8 @@ typedef struct _console_color {
 
 extern "C" {
 
-void Console_Init(void* (*resolver)(const char*));
+typedef void* (*Console_SymResolverProc)(const char*);
+void Console_Init(Console_SymResolverProc);
 
 Console_con*
 Console_Create(const char* title,
