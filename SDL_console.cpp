@@ -1250,8 +1250,8 @@ public:
         : Widget(parent)
         , page_size(page_size)
     {
-        connect_global(SDL_MOUSEBUTTONDOWN, [this](SDL_MouseButtonEvent& e) {
-            this->on_SDL_MouseButtonDown(mb);
+        connect_global(SDL_MOUSEBUTTONDOWN, [this](SDL_Event& e) {
+            this->on_SDL_MouseButtonDown(e.button);
         });
 
         connect_global(SDL_MOUSEBUTTONUP, [this](SDL_Event& e) {
