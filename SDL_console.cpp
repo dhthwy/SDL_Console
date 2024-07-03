@@ -422,6 +422,183 @@ void split_entry_text(
     LogEntry& entry,
     std::u32string& text);
 
+struct ISlot {
+    virtual ~ISlot() = default;
+    virtual void invoke(SDL_Event& event) = 0;
+    virtual void disconnect() = 0;
+    virtual void connect() = 0;
+    virtual bool is_connected() = 0;
+};
+
+struct ISignal {
+    virtual ~ISignal() = default;
+    // todo for connect()
+    virtual void disconnect(Uint32 event_type, ISlot* slot) = 0;
+    virtual void reconnect(Uint32 event_type, ISlot* slot) = 0;
+    virtual bool is_connected(Uint32 event_type, ISlot* slot) = 0;
+};
+
+template <typename EventType>
+class Slot : public ISlot {
+public:
+    using Func = std::function<void(EventType&)>;
+
+    Slot(ISignal& emitter, Uint32 event_type, Func& func)
+        : emitter_(emitter)
+        , event_type_(event_type)
+        , func_(func)
+    {
+    }
+
+    void invoke(SDL_Event& event) override
+    {
+        func_(get_event(event));
+    }
+
+    void disconnect() override
+    {
+        emitter_.disconnect(event_type_, this);
+    }
+
+    void connect() override
+    {
+        emitter_.reconnect(event_type_, this);
+    }
+
+    bool is_connected() override
+    {
+        return emitter_.is_connected(event_type_, this);
+    }
+
+    ~Slot()
+    {
+    }
+
+private:
+    ISignal& emitter_;
+    Uint32 event_type_;
+    Func func_;
+
+    EventType& get_event(SDL_Event& event)
+    {
+        if constexpr (std::is_same_v<EventType, SDL_KeyboardEvent>) {
+            return event.key;
+        } else if constexpr (std::is_same_v<EventType, SDL_MouseButtonEvent>) {
+            return event.button;
+        } else if constexpr (std::is_same_v<EventType, SDL_MouseMotionEvent>) {
+            return event.motion;
+        } else if constexpr (std::is_same_v<EventType, SDL_UserEvent>) {
+            return event.user;
+        } else if constexpr (std::is_same_v<EventType, SDL_TextInputEvent>) {
+            return event.text;
+        } else if constexpr (std::is_same_v<EventType, SDL_MouseWheelEvent>) {
+            return event.wheel;
+        } else if constexpr (std::is_same_v<EventType, SDL_WindowEvent>) {
+            return event.window;
+        } else {
+            static_assert(std::is_same_v<EventType, void>, "Unsupported event type");
+        }
+    }
+};
+
+class SignalEmitter : public ISignal {
+public:
+    template <typename EventType>
+    ISlot* connect(Uint32 event_type, typename Slot<EventType>::Func func)
+    {
+        auto slot = std::make_unique<Slot<EventType>>(*this, event_type, func);
+        return slots_[event_type].emplace_back(std::move(slot)).get();
+    }
+
+    template <typename EventType>
+    ISlot* connect_later(Uint32 event_type, typename Slot<EventType>::Func func)
+    {
+        auto slot = std::make_unique<Slot<EventType>>(*this, event_type, func);
+        return disconnected_slots_[event_type].emplace_back(std::move(slot)).get();
+    }
+
+    void disconnect(Uint32 event_type, ISlot* slot) override
+    {
+        auto it = std::find_if(slots_[event_type].begin(), slots_[event_type].end(),
+            [slot](std::unique_ptr<ISlot>& s) {
+                return s.get() == slot;
+            });
+
+        if (it != slots_[event_type].end()) {
+            disconnected_slots_[event_type].emplace_back(std::move(*it));
+            slots_[event_type].erase(it);
+        }
+    }
+
+    void reconnect(Uint32 event_type, ISlot* slot) override
+    {
+        auto it = std::find_if(disconnected_slots_[event_type].begin(), disconnected_slots_[event_type].end(),
+            [slot](std::unique_ptr<ISlot>& s) {
+                return s.get() == slot;
+            });
+
+        if (it != disconnected_slots_[event_type].end()) {
+            slots_[event_type].emplace_back(std::move(*it));
+            disconnected_slots_[event_type].erase(it);
+        }
+    }
+
+    bool is_connected(Uint32 event_type, ISlot* slot) override
+    {
+        auto it = std::find_if(slots_[event_type].begin(), slots_[event_type].end(),
+            [slot](std::unique_ptr<ISlot>& s) {
+                return s.get() == slot;
+            });
+
+        if (it != slots_[event_type].end()) {
+            return true;
+        }
+        return false;
+    }
+
+    void emit(SDL_Event& event)
+    {
+        auto it = slots_.find(event.type);
+        if (it != slots_.end()) {
+            for (auto& slot : it->second) {
+                slot->invoke(event);
+            }
+        }
+    }
+
+    void emit(InternalEventType::Type type)
+    {
+        SDL_Event e = make_sdl_user_event(type, nullptr);
+        emit(e);
+    }
+
+    void emit(InternalEventType::Type type, void* data1)
+    {
+        SDL_Event e = make_sdl_user_event(type, data1);
+        emit(e);
+    }
+
+    void clear()
+    {
+        slots_.clear();
+        disconnected_slots_.clear();
+    }
+
+    static SDL_Event make_sdl_user_event(InternalEventType::Type type, void* data1)
+    {
+        SDL_Event event;
+        console::SDL_zero(event);
+        event.type = type;
+        event.user.data1 = data1;
+        return event;
+    }
+
+private:
+    using Container = std::vector<std::unique_ptr<ISlot>>;
+    std::map<Uint32, Container> slots_;
+    std::map<Uint32, Container> disconnected_slots_;
+};
+
 // For internal communication.
 class EventEmitter {
 public:
@@ -611,7 +788,7 @@ struct Glyph {
 };
 struct FontLoader;
 // XXX, TODO: cleanup.
-struct Font : public EventEmitter {
+struct Font : public SignalEmitter {
     FontLoader& loader;
     SDL_Texture* texture;
     std::vector<Glyph> glyphs;
@@ -904,19 +1081,19 @@ struct BMPFontLoader : public FontLoader {
 
 struct MainWindow;
 struct WidgetContext {
-    WidgetContext(SDL_Renderer* r, EventEmitter* em, SDL_Point& mouse)
+    WidgetContext(SDL_Renderer* r, SignalEmitter* em, SDL_Point& mouse)
         : renderer(r)
         , global_emitter(em)
         , mouse_coord(mouse)
     {
     }
     SDL_Renderer* renderer;
-    EventEmitter* global_emitter;
+    SignalEmitter* global_emitter;
     SDL_Point& mouse_coord;
 };
 
 // TODO: needs work
-struct Widget {
+struct Widget : public SignalEmitter {
 public:
     Widget* parent;
     Font* font;
@@ -964,26 +1141,30 @@ public:
         font = font->loader.open(file, size);
     }
 
+    /*
     const EventEmitter::Slot* connect(Uint32 event_type, const EventEmitter::Slot& func)
     {
         return emitter.connect(event_type, func);
-    }
+    }*/
 
-    EventEmitter::Slot* connect_global(Uint32 event_type, const EventEmitter::Slot& func)
+    template <typename EventType, typename... Args>
+    ISlot* connect_global(Args&&... args)
     {
-        return context.global_emitter->connect(event_type, func);
+        return context.global_emitter->connect<EventType>(std::forward<Args>(args)...);
     }
 
-    void disconnect_global(Uint32 event_type, const EventEmitter::Slot* func)
+    template <typename... Args>
+    void disconnect_global(Args&&... args)
     {
-        context.global_emitter->disconnect(event_type, func);
+        context.global_emitter->disconnect(std::forward<Args>(args)...);
     }
 
+    /*
     template <typename... Args>
     void emit(Args&&... args)
     {
         emitter.emit(std::forward<Args>(args)...);
-    }
+    }*/
 
     template <typename... Args>
     void emit_global(Args&&... args)
@@ -1002,9 +1183,10 @@ public:
     Widget(const Widget&) = delete;
     Widget& operator=(const Widget&) = delete;
 
+    WidgetContext& context;
+
 private:
     EventEmitter emitter;
-    WidgetContext& context;
 };
 
 struct Prompt : public Widget {
@@ -1024,13 +1206,11 @@ struct Prompt : public Widget {
         // For transparancy
         console::SDL_SetTextureBlendMode(cursor_texture, SDL_BLENDMODE_BLEND);
 
-        connect_global(SDL_KEYDOWN, [this](SDL_Event& e) {
-            on_key_down(e.key);
+        connect_global<SDL_KeyboardEvent>(SDL_KEYDOWN, [this](SDL_KeyboardEvent& e) {
+            on_key_down(e);
         });
 
-        connect_global(SDL_TEXTINPUT, [this](SDL_Event& e) {
-            add_input(from_utf8(e.text.text));
-        });
+        connect_global<SDL_TextInputEvent>(SDL_TEXTINPUT, [this](SDL_TextInputEvent& e) { add_input(from_utf8(e.text)); });
     }
 
     ~Prompt()
@@ -1243,19 +1423,29 @@ private:
     int range_value { 0 };
     bool depressed { false };
     SDL_Rect thumb_rect {};
-    EventEmitter::Slot* on_SDL_MouseMotion_ref { nullptr };
+    ISlot* slot_SDL_MouseMotionEvent { nullptr };
 
 public:
     Scrollbar(Widget* parent, int page_size)
         : Widget(parent)
         , page_size(page_size)
     {
-        connect_global(SDL_MOUSEBUTTONDOWN, [this](SDL_Event& e) {
-            this->on_SDL_MouseButtonDown(e.button);
+        connect_global<SDL_MouseButtonEvent>(SDL_MOUSEBUTTONDOWN, [this](SDL_MouseButtonEvent& e) {
+            this->on_SDL_MouseButtonDown(e);
         });
 
-        connect_global(SDL_MOUSEBUTTONUP, [this](SDL_Event& e) {
-            this->on_SDL_MouseButtonUp(e.button);
+        connect_global<SDL_MouseButtonEvent>(SDL_MOUSEBUTTONUP, [this](SDL_MouseButtonEvent& e) {
+            this->on_SDL_MouseButtonUp(e);
+        });
+
+        slot_SDL_MouseMotionEvent = context.global_emitter->connect_later<SDL_MouseMotionEvent>(SDL_MOUSEMOTION, [this](SDL_MouseMotionEvent& e) {
+            if (!depressed)
+                return;
+
+            int y = e.y;
+            range_value = range_value_from_track_position(y);
+            set_thumb_position(y);
+            emit(InternalEventType::value_changed, &range_value);
         });
 
         thumb_rect = viewport;
@@ -1268,16 +1458,8 @@ public:
             return;
         }
 
-        if (on_SDL_MouseMotion_ref == nullptr) {
-            on_SDL_MouseMotion_ref = connect_global(SDL_MOUSEMOTION, [this](SDL_Event& e) {
-                if (!depressed)
-                    return;
-
-                int y = e.button.y;
-                range_value = range_value_from_track_position(y);
-                set_thumb_position(y);
-                emit(InternalEventType::value_changed, &range_value);
-            });
+        if (!slot_SDL_MouseMotionEvent->is_connected()) {
+            slot_SDL_MouseMotionEvent->connect();
         }
 
         depressed = true;
@@ -1291,10 +1473,7 @@ public:
     {
         if (depressed) {
             depressed = false;
-            if (on_SDL_MouseMotion_ref) {
-                disconnect_global(SDL_MOUSEMOTION, on_SDL_MouseMotion_ref);
-                on_SDL_MouseMotion_ref = nullptr;
-            }
+            slot_SDL_MouseMotionEvent->disconnect();
         }
     }
 
@@ -1401,15 +1580,15 @@ public:
         , label(label)
     {
         size_text();
-        connect_global(SDL_MOUSEBUTTONDOWN, [this](SDL_Event& e) {
-            this->on_mouse_button_down(e.button);
+        connect_global<SDL_MouseButtonEvent>(SDL_MOUSEBUTTONDOWN, [this](SDL_MouseButtonEvent& e) {
+            this->on_mouse_button_down(e);
         });
 
-        connect_global(SDL_MOUSEBUTTONUP, [this](SDL_Event& e) {
-            this->on_mouse_button_up(e.button);
+        connect_global<SDL_MouseButtonEvent>(SDL_MOUSEBUTTONUP, [this](SDL_MouseButtonEvent& e) {
+            this->on_mouse_button_up(e);
         });
 
-        font->connect(InternalEventType::font_size_changed, [this](SDL_Event& e) {
+        font->connect<SDL_UserEvent>(InternalEventType::font_size_changed, [this](SDL_UserEvent& e) {
             size_text();
             std::cerr << "font_size_changed" << std::endl;
         });
@@ -1493,13 +1672,13 @@ struct Toolbar : public Widget {
 };
 
 struct InputLineWaiter {
-    EventEmitter& emitter;
+    SignalEmitter& emitter;
 
-    InputLineWaiter(EventEmitter& emitter)
+    InputLineWaiter(SignalEmitter& emitter)
         : emitter(emitter)
     {
-        emitter.connect(InternalEventType::new_input_line, [this](SDL_Event& e) {
-            auto* str = static_cast<std::u32string*>(e.user.data1);
+        emitter.connect<SDL_UserEvent>(InternalEventType::new_input_line, [this](SDL_UserEvent& e) {
+            auto* str = static_cast<std::u32string*>(e.data1);
             (str == nullptr) ? push(U"") : push(*str);
         });
     }
@@ -1578,37 +1757,37 @@ struct LogScreen : public Widget {
         scrollbar.set_page_size(rows());
         scrollbar.set_range(rows());
 
-        connect_global(SDL_MOUSEBUTTONDOWN, [this](SDL_Event& e) {
-            on_mouse_button_down(e.button);
+        connect_global<SDL_MouseButtonEvent>(SDL_MOUSEBUTTONDOWN, [this](SDL_MouseButtonEvent& e) {
+            on_mouse_button_down(e);
         });
 
-        connect_global(SDL_MOUSEBUTTONUP, [this](SDL_Event& e) {
-            on_mouse_button_up(e.button);
+        connect_global<SDL_MouseButtonEvent>(SDL_MOUSEBUTTONUP, [this](SDL_MouseButtonEvent& e) {
+            on_mouse_button_up(e);
         });
 
-        connect_global(SDL_MOUSEWHEEL, [this](SDL_Event& e) {
-            scroll(e.wheel.y);
+        connect_global<SDL_MouseWheelEvent>(SDL_MOUSEWHEEL, [this](SDL_MouseWheelEvent& e) {
+            scroll(e.y);
         });
 
-        connect_global(SDL_MOUSEMOTION, [this](SDL_Event& e) {
-            if (!in_rect(e.button.x, e.button.y, this->viewport))
+        connect_global<SDL_MouseMotionEvent>(SDL_MOUSEMOTION, [this](SDL_MouseMotionEvent& e) {
+            if (!in_rect(e.x, e.y, this->viewport))
                 return;
             if (depressed) {
-                set_mouse_motion_end({ e.motion.x, e.motion.y });
+                set_mouse_motion_end({ e.x, e.y });
             }
         });
 
-        connect_global(SDL_KEYDOWN, [this](SDL_Event& e) {
-            on_key_down(e.key);
+        connect_global<SDL_KeyboardEvent>(SDL_KEYDOWN, [this](SDL_KeyboardEvent& e) {
+            on_key_down(e);
         });
 
-        connect_global(SDL_TEXTINPUT, [this](SDL_Event& e) {
+        connect_global<SDL_TextInputEvent>(SDL_TEXTINPUT, [this](SDL_TextInputEvent& e) {
             scroll_value = 0;
-            emit(InternalEventType::value_changed, &scroll_value);
+            emit(InternalEventType::value_changed, &scroll_value); // ? XXX: check why
         });
 
-        scrollbar.connect(InternalEventType::value_changed, [this](SDL_Event& e) {
-            scroll_value = *static_cast<int*>(e.user.data1);
+        scrollbar.connect<SDL_UserEvent>(InternalEventType::value_changed, [this](SDL_UserEvent& e) {
+            scroll_value = *static_cast<int*>(e.data1);
         });
     }
 
@@ -2058,7 +2237,7 @@ struct MainWindow : public Widget {
     Uint32 window_id; // Window id from SDL
     void render() {};
 
-    MainWindow(WindowContext winctx, Font* font, EventEmitter& emitter)
+    MainWindow(WindowContext winctx, Font* font, SignalEmitter& emitter)
         : Widget(font, widget_context, winctx.rect)
         , widget_context(winctx.renderer, &emitter, mouse_coord)
         , handle(winctx.handle)
@@ -2067,16 +2246,16 @@ struct MainWindow : public Widget {
         if (window_id == 0)
             throw(std::runtime_error(SDL_GetError()));
 
-        connect_global(SDL_WINDOWEVENT, [this](SDL_Event& e) {
-            if (e.window.event == SDL_WINDOWEVENT_RESIZED) {
+        connect_global<SDL_WindowEvent>(SDL_WINDOWEVENT, [this](SDL_WindowEvent& e) {
+            if (e.event == SDL_WINDOWEVENT_RESIZED) {
                 console::SDL_GetRendererOutputSize(renderer(), &viewport.w, &viewport.h);
                 on_resize(viewport);
             }
         });
 
-        connect_global(SDL_MOUSEMOTION, [this](SDL_Event& e) {
-            mouse_coord.x = e.button.x;
-            mouse_coord.y = e.button.y;
+        connect_global<SDL_MouseMotionEvent>(SDL_MOUSEMOTION, [this](SDL_MouseMotionEvent& e) {
+            mouse_coord.x = e.x;
+            mouse_coord.y = e.y;
         });
 
         console::SDL_SetWindowMinimumSize(handle, 64, 48);
@@ -2135,7 +2314,7 @@ Toolbar::Toolbar(Widget* parent, SDL_Rect viewport)
     : Widget(parent, viewport)
 {
 
-    font->connect(InternalEventType::font_size_changed, [this](SDL_Event& e) {
+    font->connect<SDL_UserEvent>(InternalEventType::font_size_changed, [this](SDL_UserEvent& e) {
         size_buttons();
         std::cerr << "font_size_changed" << std::endl;
     });
@@ -2457,7 +2636,7 @@ private:
 struct Console_con {
     struct Impl {
         // For internal communication, mainly by widgets.
-        EventEmitter internal_emitter;
+        SignalEmitter internal_emitter;
         MainWindow window;
         // Opens and caches Font objects.
         // A new Font object may be used when
@@ -2631,23 +2810,23 @@ Console_Create(const char* title,
         con->init(wctx, std::move(font_loader));
 
         Widget* copy = con->impl->window.toolbar->add_button(U"Copy");
-        copy->connect(InternalEventType::clicked, [con](SDL_Event& e) {
+        copy->connect<SDL_UserEvent>(InternalEventType::clicked, [con](SDL_UserEvent& e) {
             con->lscreen().copy_to_clipboard();
         });
 
         Widget* paste = con->impl->window.toolbar->add_button(U"Paste");
-        paste->connect(InternalEventType::clicked, [con](SDL_Event& e) {
+        paste->connect<SDL_UserEvent>(InternalEventType::clicked, [con](SDL_UserEvent& e) {
             con->lscreen().add_prompt_input_from_clipboard();
         });
 
         //* Best to change font size in a menu, I think.
         Widget* font_inc = con->impl->window.toolbar->add_button(U"A+");
-        font_inc->connect(InternalEventType::clicked, [con](SDL_Event& e) {
+        font_inc->connect<SDL_UserEvent>(InternalEventType::clicked, [con](SDL_UserEvent& e) {
             con->lscreen().font->incr_size();
         });
 
         Widget* font_dec = con->impl->window.toolbar->add_button(U"A-");
-        font_dec->connect(InternalEventType::clicked, [con](SDL_Event& e) {
+        font_dec->connect<SDL_UserEvent>(InternalEventType::clicked, [con](SDL_UserEvent& e) {
             con->lscreen().font->decr_size();
         });
 
@@ -2669,8 +2848,8 @@ Console_Create(const char* title,
     } catch (std::runtime_error& e) {
         console::SDL_QuitSubSystem(SDL_INIT_VIDEO);
         std::cerr << e.what() << std::endl;
-        return nullptr;
     }
+    return nullptr;
 }
 
 void Console_SetPrompt(Console_con* con,
