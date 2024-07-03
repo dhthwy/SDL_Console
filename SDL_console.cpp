@@ -1491,18 +1491,21 @@ public:
 
     void set_value(int value)
     {
+        bool ok_to_zero = true;
+        // value is increasing, so don't snap back to zero
+        if (value > range_value)
+            ok_to_zero = false;
         range_value = value;
-        set_thumb_position(track_position_from_range_value());
+        set_thumb_position(track_position_from_range_value(), ok_to_zero);
         // std::cerr << "value: " << value << " trackpos: " << track_position_from_range_value() << std::endl;
     }
 
     void set_viewport(SDL_Rect new_viewport) override
     {
         viewport = new_viewport;
-        int saved_y = thumb_rect.y;
         thumb_rect = viewport;
-        thumb_rect.y = saved_y;
         set_thumb_height();
+        set_thumb_position(track_position_from_range_value(), true);
     }
 
     void render() override
@@ -1523,7 +1526,7 @@ public:
     Scrollbar& operator=(const Scrollbar&) = delete;
 
 private:
-    void set_thumb_position(int y)
+    void set_thumb_position(int y, bool ok_to_zero = true)
     {
         int track_start = viewport.y;
         int track_end = viewport.y + viewport.h;
@@ -1539,12 +1542,16 @@ private:
         // Prevent thumb from going beyond the bottom of the track
         if (thumb_rect.y + thumb_rect.h > track_end) {
             thumb_rect.y = track_end - thumb_rect.h;
+            if (ok_to_zero) {
+                range_value = 0;
+                emit(InternalEventType::value_changed, &range_value);
+            }
         }
     }
 
     void set_thumb_height()
     {
-        float thumb_ratio = static_cast<float>(page_size) / max_range_value;
+        float thumb_ratio = static_cast<float>(page_size) / (max_range_value - range_value);
         int thumb_size = static_cast<int>(std::round(thumb_ratio * viewport.h));
         thumb_rect.h = std::min(viewport.h, std::max(thumb_size, 10)); // Thumb is at least a minimum size
     }
