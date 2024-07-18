@@ -18,6 +18,7 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include <ranges>
 
 #include "SDL_console.h"
 
@@ -167,70 +168,43 @@ static std::string to_utf8(const std::u32string& str)
 }
 #endif
 
-/* For consistency it might be better to stick with one utf8 library */
-static std::string to_utf8(const std::u32string& s)
+size_t utf8_strlen(const char* str)
 {
-    // Can be removed if confirmed iconv plays well with empty strings
-    if (s.empty())
-        return "";
-
-    // Not sure how safe this is.
-    const char* p = reinterpret_cast<const char*>(s.c_str());
-    // Need to make room for utf8 + terminating null, so can't use character count here..
-    char* conv_bytes = console::SDL_iconv_string("UTF-8", "UTF32", p, (s.length() + 1) * sizeof(char32_t));
-    if (!conv_bytes)
-        return "";
-
-    std::string result = conv_bytes;
-    console::SDL_free(conv_bytes);
-    return result;
-}
-
-void center_rect(SDL_Rect& r)
-{
-    r.x = r.x - r.w / 2;
-    r.y = r.y - r.h / 2;
-}
-
-/*
- * Slightly modified version from SDL
- * https://github.com/libsdl-org/SDL/blob/ab3c8552c2733e03c47253c5840bed7a27716244/src/stdlib/SDL_string.c#L157C8-L157C21
- */
-
-#define INVALID_UNICODE_CODEPOINT 0xFFFD
-static Uint32 SDL_StepUTF8(const char* _str, int* pos, const size_t slen)
-{
-    const char* str = (_str + *pos);
-    const Uint32 octet = (Uint32)(slen ? ((Uint8)*str) : 0);
-
-    // !!! FIXME: this could have _way_ more error checking! Illegal surrogate codepoints, unexpected bit patterns, etc.
-
-    if (octet == 0) { // null terminator, end of string.
-        return 0; // don't advance `*_str`.
-    } else if ((octet & 0x80) == 0) { // 0xxxxxxx: one byte codepoint.
-        (*pos)++;
-        return octet;
-    } else if (((octet & 0xE0) == 0xC0) && (slen >= 2)) { // 110xxxxx 10xxxxxx: two byte codepoint.
-        if (slen >= 2) {
-            *pos += 2;
-            return ((octet & 0x1F) << 6) | (((Uint8)str[1]) & 0x3F);
+    size_t count = 0;
+    size_t i = 0;
+    while (str[i]) {
+        unsigned char byte = str[i];
+        if ((byte & 0x80) == 0) {
+            ++i;
+        } else if ((byte & 0xE0) == 0xC0) {
+            i += 2;
+        } else if ((byte & 0xF0) == 0xE0) {
+            i += 3;
+        } else if ((byte & 0xF8) == 0xF0) {
+            i += 4;
+        } else {
+            // Invalid byte
+            ++i;
         }
-    } else if (((octet & 0xF0) == 0xE0) && (slen >= 3)) { // 1110xxxx 10xxxxxx 10xxxxxx: three byte codepoint.
-        *pos += 3;
-        const Uint32 octet2 = ((Uint32)(((Uint8)str[1]) & 0x1F)) << 6;
-        const Uint32 octet3 = (Uint32)(((Uint8)str[2]) & 0x3F);
-        return ((octet & 0x0F) << 12) | octet2 | octet3;
-    } else if (((octet & 0xF8) == 0xF0) && (slen >= 4)) { // 11110xxxx 10xxxxxx 10xxxxxx 10xxxxxx: four byte codepoint.
-        *pos += 4;
-        const Uint32 octet2 = ((Uint32)(((Uint8)str[1]) & 0x1F)) << 12;
-        const Uint32 octet3 = ((Uint32)(((Uint8)str[2]) & 0x3F)) << 6;
-        const Uint32 octet4 = (Uint32)(((Uint8)str[3]) & 0x3F);
-        return ((octet & 0x07) << 18) | octet2 | octet3 | octet4;
+        ++count;
     }
+    return count;
+}
 
-    // bogus byte, skip ahead, return a REPLACEMENT CHARACTER.
-    (*pos)++;
-    return INVALID_UNICODE_CODEPOINT;
+/* For consistency it might be better to stick with one utf8 library */
+static std::string to_utf8(const std::u32string& str)
+{
+    // SDL casts the type from wide to narrow when necessary for these things. Should be ok.
+    const char* strp = reinterpret_cast<const char*>(str.data());
+    // Need to make room for utf8 + terminating null. Can't use character count here.
+    size_t utf8_len = (str.length() + 1) * sizeof(char32_t);
+    char* utf8_str = console::SDL_iconv_string("UTF-8", "UTF-32LE", strp, utf8_len);
+    if (!utf8_str)
+        return "?u8?";
+
+    std::string result(utf8_str);
+    console::SDL_free(utf8_str);
+    return result;
 }
 
 #if 0
@@ -249,51 +223,19 @@ static std::u32string from_utf8(const char* s)
 }
 #endif
 
-size_t utf8_strlen(const char* utf8str)
-{
-    size_t count = 0;
-    size_t i = 0;
-    while (utf8str[i]) {
-        unsigned char byte = utf8str[i];
-        if ((byte & 0x80) == 0) {
-            ++i;
-        } else if ((byte & 0xE0) == 0xC0) {
-            i += 2;
-        } else if ((byte & 0xF0) == 0xE0) {
-            i += 3;
-        } else if ((byte & 0xF8) == 0xF0) {
-            i += 4;
-        } else {
-            // Invalid byte
-            ++i;
-        }
-        ++count;
-    }
-    return count;
-}
-
 static std::u32string from_utf8(const char* str)
 {
-    // Do we care about truncating long lines?
-    // 8k bytes, might be smart to reduce it to a memory page.
-    char32_t buf[2048];
-    constexpr int buf_siz = sizeof(buf) / sizeof(char32_t);
-    // char32_t* pbuf = buf;
-    size_t len = utf8_strlen(str);
-    // if (len > buf_siz - 1)
-    //     pbuf = new char32_t(len + 1);
+    int char_len = utf8_strlen(str);
+    if (char_len == 0)
+        return U"";
 
-    int step = 0;
-    int idx = 0;
-    for (Uint32 codepoint = 1; codepoint && idx < buf_siz - 1; ++idx) {
-        // SDL_StepUTF8 isn't exported, but just in case.
-        codepoint = console::SDL_StepUTF8(str, &step, 4);
-        buf[idx] = codepoint;
-    }
-    // Terminate in case line was too long.
-    buf[idx] = U'\0';
-    // std::u32string ret = pbuf;
-    return buf;
+    char* char32_bytes = SDL_iconv_string("UTF-32LE", "UTF-8", str, (char_len + 1) * sizeof(char32_t));
+    if (!char32_bytes)
+        return U"?u8?";
+
+    std::u32string result(reinterpret_cast<char32_t*>(char32_bytes));
+    SDL_free(char32_bytes);
+    return result;
 }
 
 // For testing purposes, to be removed
@@ -356,6 +298,12 @@ static const std::unordered_map<char32_t, uint8_t> unicode_to_cp437 = {
     { U'\u00B0', 0xF8 }, { U'\u2219', 0xF9 }, { U'\u00B7', 0xFA }, { U'\u221A', 0xFB },
     { U'\u207F', 0xFC }, { U'\u00B2', 0xFD }, { U'\u25A0', 0xFE }, { U'\u00A0', 0xFF }
 };
+
+void center_rect(SDL_Rect& r)
+{
+    r.x = r.x - r.w / 2;
+    r.y = r.y - r.h / 2;
+}
 
 enum class ScrollDirection {
     up,
@@ -519,41 +467,35 @@ public:
 
     void disconnect(Uint32 event_type, ISlot* slot) override
     {
-        auto it = std::find_if(slots_[event_type].begin(), slots_[event_type].end(),
-            [slot](std::unique_ptr<ISlot>& s) {
-                return s.get() == slot;
-            });
+        auto& disconnected_slots = disconnected_slots_[event_type];
+        auto it = std::ranges::find_if(disconnected_slots, [slot](const std::unique_ptr<ISlot>& s) {
+            return s.get() == slot;
+        });
 
-        if (it != slots_[event_type].end()) {
-            disconnected_slots_[event_type].emplace_back(std::move(*it));
+        if (it != disconnected_slots.end()) {
+            disconnected_slots.emplace_back(std::move(*it));
             slots_[event_type].erase(it);
         }
     }
 
     void reconnect(Uint32 event_type, ISlot* slot) override
     {
-        auto it = std::find_if(disconnected_slots_[event_type].begin(), disconnected_slots_[event_type].end(),
-            [slot](std::unique_ptr<ISlot>& s) {
-                return s.get() == slot;
-            });
+        auto& disconnected_slots = disconnected_slots_[event_type];
+        auto it = std::ranges::find_if(disconnected_slots, [slot](const std::unique_ptr<ISlot>& s) {
+            return s.get() == slot;
+        });
 
-        if (it != disconnected_slots_[event_type].end()) {
+        if (it != disconnected_slots.end()) {
             slots_[event_type].emplace_back(std::move(*it));
-            disconnected_slots_[event_type].erase(it);
+            disconnected_slots.erase(it);
         }
     }
 
     bool is_connected(Uint32 event_type, ISlot* slot) override
     {
-        auto it = std::find_if(slots_[event_type].begin(), slots_[event_type].end(),
-            [slot](std::unique_ptr<ISlot>& s) {
-                return s.get() == slot;
-            });
-
-        if (it != slots_[event_type].end()) {
-            return true;
-        }
-        return false;
+        return std::ranges::any_of(slots_[event_type], [slot](const std::unique_ptr<ISlot>& s) {
+            return s.get() == slot;
+        });
     }
 
     void emit(SDL_Event& event)
@@ -1486,7 +1428,7 @@ public:
     {
         max_range_value = value;
         set_thumb_height();
-        std::cerr << "max_range_value: " << value << " thumb_h: " << thumb_rect.h << " page_size: " << page_size << std::endl;
+        // std::cerr << "max_range_value: " << value << " thumb_h: " << thumb_rect.h << " page_size: " << page_size << std::endl;
     }
 
     void set_value(int value)
@@ -2182,14 +2124,14 @@ struct LogScreen : public Widget {
         srect.y = std::min(mouse_start.y, mouse_end.y);
         srect.y = std::floor(static_cast<float>(srect.y) / line_height) * line_height;
 
-        srect.h = std::abs(mouse_end.y - mouse_start.y);
+        srect.h = std::abs(mouse_end.y - mouse_start.y) + 1;
         srect.h = std::ceil(static_cast<float>(srect.h) / line_height) * line_height;
 
         int start_x = (mouse_start.y <= mouse_end.y) ? mouse_start.x : mouse_end.x;
         start_x = std::floor(static_cast<float>(start_x) / char_width) * char_width;
 
         SDL_Rect cur_rect = { start_x, srect.y, srect.w, line_height };
-        int rows = srect.h / line_height;
+        int rows = std::ceil((float)srect.h / line_height);
 
         std::vector<SDL_Rect> rects;
         rects.push_back(cur_rect);
@@ -2453,16 +2395,6 @@ public:
         }
     }
 
-    void drain()
-    {
-        SDL_Event e;
-        while (sdl.pop(e))
-            ;
-        Task t;
-        while (api.pop(t))
-            ;
-    }
-
     void reset()
     {
         drain();
@@ -2487,6 +2419,16 @@ public:
     EventQueue<Task> api;
 
 private:
+    void drain()
+    {
+        SDL_Event e;
+        while (sdl.pop(e))
+            ;
+        Task t;
+        while (api.pop(t))
+            ;
+    }
+
     Notifier notifier { false };
     State state = { State::active };
 };
