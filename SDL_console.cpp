@@ -305,6 +305,16 @@ void center_rect(SDL_Rect& r)
     r.y = r.y - r.h / 2;
 }
 
+int snap_to_min(int value, int grid_size)
+{
+    return std::floor(static_cast<float>(value) / grid_size) * grid_size;
+}
+
+int snap_to_max(int value, int grid_size)
+{
+    return std::ceil(static_cast<float>(value) / grid_size) * grid_size;
+}
+
 enum class ScrollDirection {
     up,
     down,
@@ -1988,7 +1998,7 @@ struct LogScreen : public Widget {
         std::u32string ret;
         char32_t sep = U'\n';
 
-        auto rects = get_highlighted_line_rects();
+        auto rects = get_highlighted_rects();
         std::reverse(rects.begin(), rects.end());
         for (auto entry_rit = entries.rbegin(); entry_rit != entries.rend(); ++entry_rit) {
             auto& entry = *entry_rit;
@@ -2092,7 +2102,7 @@ struct LogScreen : public Widget {
         if (mouse_motion_end.y == -1)
             return;
 
-        auto rects = get_highlighted_line_rects();
+        auto rects = get_highlighted_rects();
         if (rects.empty())
             return;
 
@@ -2104,60 +2114,53 @@ struct LogScreen : public Widget {
         set_draw_color(renderer(), colors::darkgray);
     }
 
-    // XXX: fix shimmering when going from bottom to top or right to left
     // XXX: cleanup
-    std::vector<SDL_Rect> get_highlighted_line_rects()
+    std::vector<SDL_Rect> get_highlighted_rects()
     {
         const int char_width = font->char_width;
         const int line_height = font->line_height;
-        const SDL_Point& mouse_start = mouse_motion_start;
-        const SDL_Point& mouse_end = mouse_motion_end;
+        const SDL_Point& selection_start = mouse_motion_start;
+        const SDL_Point& selection_end = mouse_motion_end;
 
         // Calculate the start and end positions, snapping to line and character boundaries
-        SDL_Rect srect;
-        srect.x = std::min(mouse_start.x, mouse_end.x);
-        srect.x = std::floor(static_cast<float>(srect.x) / char_width) * char_width;
+        auto [top_point, bottom_point] = std::minmax({selection_start, selection_end},
+                                            [](const SDL_Point& a, const SDL_Point& b) {
+                                                return a.y < b.y;
+                                            });
 
-        srect.w = std::abs(mouse_end.x - mouse_start.x);
-        srect.w = std::ceil(static_cast<float>(srect.w) / char_width) * char_width;
+        auto top = snap_to_min(top_point.y, line_height);
+        auto bottom = snap_to_max(bottom_point.y, line_height);
+        bool is_single_row = (bottom_point.y - top_point.y) <= line_height;
 
-        srect.y = std::min(mouse_start.y, mouse_end.y);
-        srect.y = std::floor(static_cast<float>(srect.y) / line_height) * line_height;
-
-        srect.h = std::abs(mouse_end.y - mouse_start.y) + 1;
-        srect.h = std::ceil(static_cast<float>(srect.h) / line_height) * line_height;
-
-        int start_x = (mouse_start.y <= mouse_end.y) ? mouse_start.x : mouse_end.x;
-        start_x = std::floor(static_cast<float>(start_x) / char_width) * char_width;
-
-        SDL_Rect cur_rect = { start_x, srect.y, srect.w, line_height };
-        int rows = std::ceil((float)srect.h / line_height);
-
-        std::vector<SDL_Rect> rects;
-        rects.push_back(cur_rect);
-        if (rows == 1)
-            return rects;
-
-        // Handle intermediate rows
-        cur_rect.y += line_height;
-        for (int i = 1; i < rows; i++) {
-            rects.back().w = viewport.w;
-            cur_rect.x = 0;
-
-            cur_rect.w = std::ceil(static_cast<float>(cur_rect.w) / char_width) * char_width;
-
-            rects.push_back(cur_rect);
-            cur_rect.y += line_height;
-        }
-
-        // Adjust width for last row with respect to direction
-        if (mouse_start.y > mouse_end.y) {
-            rects.back().w = mouse_start.x;
+        int left;
+        int right;
+        if (is_single_row) {
+            left = snap_to_min(std::min(selection_start.x, selection_end.x), char_width);
+            right = snap_to_max(std::max(selection_start.x, selection_end.x), char_width);
         } else {
-            rects.back().w = mouse_end.x;
+            left = snap_to_min(top_point.x, char_width);
+            right = snap_to_max(bottom_point.x, char_width);
         }
 
-        return rects;
+        SDL_Rect current_rect = { left, top, (right - left), line_height };
+        if (is_single_row)
+            return { current_rect };
+
+        int rows = std::ceil((float)(bottom - top) / line_height);
+        std::vector<SDL_Rect> selected_rects;
+        current_rect.w = viewport.w;
+        selected_rects.push_back(current_rect);
+        // Handle intermediate rows
+        for (int i = 1; i < rows; ++i) {
+            current_rect.x = 0;
+            current_rect.y = top + i * line_height;
+            current_rect.w = viewport.w;
+            selected_rects.push_back(current_rect);
+        }
+        // Fill last row to end of selected text
+        selected_rects.back().w = right;
+
+        return selected_rects;
     }
 
     LogScreen(const LogScreen&) = delete;
