@@ -746,11 +746,11 @@ struct Font : public SignalEmitter {
     std::vector<Glyph> glyphs;
     int char_width;
     int line_height;
-    float scale { 1 };
-    int line_space { 4 };
+    int vertical_spacing;
+    float scale_factor { 1 };
     int orig_char_width;
     int orig_line_height;
-    int scale_step { 2 };
+    int size_delta { 2 };
 
     Font(FontLoader& loader, SDL_Texture* texture, std::vector<Glyph>& glyphs, int char_width, int line_height)
         : loader(loader)
@@ -760,7 +760,8 @@ struct Font : public SignalEmitter {
         , line_height(line_height)
     {
         this->char_width = char_width;
-        this->line_height = line_space + line_height;
+        this->line_height = line_height;
+        this->vertical_spacing = line_height * 0.5;
         orig_char_width = this->char_width;
         orig_line_height = this->line_height;
     }
@@ -779,8 +780,8 @@ struct Font : public SignalEmitter {
                 index = unicode_glyph_index(ch);
             }
             Glyph& g = glyphs[index];
-            SDL_Rect dst = { x, y, static_cast<int>(g.rect.w * scale), static_cast<int>(g.rect.h * scale) };
-            x += g.rect.w * scale;
+            SDL_Rect dst = { x, y + (vertical_spacing / 2), (int)(g.rect.w * scale_factor), (int)((g.rect.h * scale_factor)) };
+            x += g.rect.w * scale_factor;
             console::SDL_RenderCopy(renderer, texture, &g.rect, &dst);
         }
     }
@@ -790,18 +791,22 @@ struct Font : public SignalEmitter {
     void size_text(const std::u32string& s, int& w, int& h)
     {
         w = s.length() * char_width;
-        h = line_height;
+        h = line_height + vertical_spacing;
+    }
+
+    int line_height_with_spacing() {
+        return line_height + vertical_spacing;
     }
 
     void incr_size()
     {
-        scale_font_size(scale_step);
+        change_size(size_delta);
         emit(InternalEventType::font_size_changed);
     }
 
     void decr_size()
     {
-        scale_font_size(-scale_step);
+        change_size(-size_delta);
         emit(InternalEventType::font_size_changed);
     }
 
@@ -820,7 +825,8 @@ struct Font : public SignalEmitter {
         , glyphs(other.glyphs)
         , char_width(other.char_width)
         , line_height(other.line_height)
-        , scale(other.scale)
+        , vertical_spacing(other.vertical_spacing)
+        , scale_factor(other.scale_factor)
         , orig_char_width(other.orig_char_width)
         , orig_line_height(other.orig_line_height)
     {
@@ -833,7 +839,8 @@ struct Font : public SignalEmitter {
             glyphs = other.glyphs;
             char_width = other.char_width;
             line_height = other.line_height;
-            scale = other.scale;
+            vertical_spacing = other.vertical_spacing;
+            scale_factor = other.scale_factor;
             orig_char_width = other.char_width;
             orig_line_height = other.line_height;
         }
@@ -844,11 +851,11 @@ struct Font : public SignalEmitter {
     Font& operator=(const Font&) = delete;
 
 private:
-    void scale_font_size(int step)
+    void change_size(int delta)
     {
-        scale = (float)(char_width + step) / (float)orig_char_width;
-        char_width = orig_char_width * scale;
-        line_height = orig_line_height * scale;
+        scale_factor = (float)(char_width + delta) / orig_char_width;
+        char_width = orig_char_width * scale_factor;
+        line_height = (orig_line_height) * scale_factor;
     }
 };
 
@@ -905,7 +912,7 @@ struct FontLoader {
         return nullptr;
     }
 
-    Font* get_font()
+    Font* default_font()
     {
         return &fmap.begin()->second;
     }
@@ -1329,7 +1336,7 @@ struct Prompt : public Widget {
             return;
         }
 
-        const auto lh = font->line_height;
+        const auto lh = font->line_height_with_spacing();
         const auto cw = font->char_width;
         /*  full range of line + cursor */
         int cx = (cursor_len - line->start_index) * cw;
@@ -1930,7 +1937,7 @@ struct LogScreen : public Widget {
         // int h = viewport.h - viewport_offset.y - margin;
         int h = viewport.h - margin;
         // max height with respect to font and margin
-        int hfit = (h / font->line_height) * font->line_height;
+        int hfit = (h / font->line_height_with_spacing()) * font->line_height_with_spacing();
 
         viewport.x = viewport_offset.x + margin;
         viewport.y = viewport_offset.y + margin;
@@ -2039,7 +2046,7 @@ struct LogScreen : public Widget {
 
     int rows()
     {
-        return (float)viewport.h / font->line_height;
+        return (float)viewport.h / font->line_height_with_spacing();
     }
 
     void render() override
@@ -2089,7 +2096,7 @@ struct LogScreen : public Widget {
 
             auto& line = *it;
             // ypos -= font->line_height * scale_factor
-            ypos -= font->line_height;
+            ypos -= font->line_height_with_spacing();
             // record y position of this line
             // line.coord.y = ypos / scale_factor
             line.coord.y = ypos;
@@ -2118,7 +2125,7 @@ struct LogScreen : public Widget {
     std::vector<SDL_Rect> get_highlighted_rects()
     {
         const int char_width = font->char_width;
-        const int line_height = font->line_height;
+        const int line_height = font->line_height_with_spacing();
         const SDL_Point& selection_start = mouse_motion_start;
         const SDL_Point& selection_end = mouse_motion_end;
 
@@ -2232,7 +2239,7 @@ struct MainWindow : public Widget {
 
     void on_resize(SDL_Rect new_viewport) override
     {
-        toolbar->on_resize({ 0, 0, viewport.w, font->line_height * 2 });
+        toolbar->on_resize({ 0, 0, viewport.w, font->line_height_with_spacing() * 2 });
         log_screen->on_resize({ 0, toolbar->viewport.h, viewport.w, viewport.h - toolbar->viewport.h });
     }
 
@@ -2606,7 +2613,7 @@ struct Console_con {
         std::thread::id render_thread_id;
 
         Impl(Console_con* con, WindowContext wctx, std::unique_ptr<FontLoader> fl, ExternalEventWaiter& external_event_waiter)
-            : window(wctx, fl->get_font(), internal_emitter)
+            : window(wctx, fl->default_font(), internal_emitter)
             , font_loader(std::move(fl))
             , input_line_waiter(internal_emitter)
             , external_event_waiter(external_event_waiter)
